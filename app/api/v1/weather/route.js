@@ -23,68 +23,53 @@ function getWindDirection(degrees) {
   return directions[index];
 }
 
-// Хелпер для поочередного опроса бесплатных ИИ шлюзов
-async function fetchAIAnalysisWithFallback(systemPrompt, userPrompt) {
-  const fullPrompt = `${systemPrompt}\n\nData to analyze:\n${userPrompt}`;
-  
-  // Пул бесплатных независимых провайдеров
-  const providers = [
-    // Провайдер 1: Pollinations (POST)
-    async () => {
-      const res = await fetch('https://text.pollinations.ai/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-          model: 'llama',
-          private: true
-        }),
-        signal: AbortSignal.timeout(6000) // таймаут 6 секунд
-      });
-      if (!res.ok) throw new Error('Pollinations failed');
-      const txt = await res.text();
-      if (txt.includes('temporary unavailable')) throw new Error('Pollinations rate limit');
-      return txt;
-    },
-    // Провайдер 2: Pollinations GET-шлюз (с другим распределением нагрузки)
-    async () => {
-      const encodedPrompt = encodeURIComponent(fullPrompt);
-      const res = await fetch(`https://text.pollinations.ai/${encodedPrompt}?model=searchshadow&cache=false`, {
-        signal: AbortSignal.timeout(6000)
-      });
-      if (!res.ok) throw new Error('Pollinations GET failed');
-      return await res.text();
-    },
-    // Провайдер 3: Ускоренный резервный текстовый инстанс (Llama-3-free)
-    async () => {
-      const res = await fetch('https://text.pollinations.ai/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [{ role: 'user', content: fullPrompt }],
-          model: 'mistral',
-          private: true
-        }),
-        signal: AbortSignal.timeout(6000)
-      });
-      if (!res.ok) throw new Error('Mistral fallback failed');
-      return await res.text();
-    }
-  ];
+// Встроенный генератор аналитики на случай, если бесплатный ИИ лежит
+function generateLocalAnalysis(weatherData) {
+  const current = weatherData.current;
+  const daily = weatherData.daily || [];
+  const hourly = weatherData.hourly || [];
+  const gfs = weatherData.models_raw?.gfs_hourly_temp || [];
 
-  // Перебираем провайдеров по очереди, пока один не ответит успешно
-  for (let i = 0; i < providers.length; i++) {
-    try {
-      const result = await providers[i]();
-      if (result && result.trim().length > 10) {
-        return result; // Возвращаем успешный ответ
+  let alerts = [];
+  let maxWindDay = { speed: 0, date: '' };
+
+  // Ищем опасную погоду на ближайшие 14 дней
+  daily.forEach(day => {
+    if (day.condition.toLowerCase().includes('thunderstorm')) {
+      alerts.push(`Thunderstorm predicted on ${day.date}`);
+    }
+    if (day.condition.toLowerCase().includes('heavy rain') || day.condition.toLowerCase().includes('heavy snow')) {
+      alerts.push(`Heavy precipitation expected on ${day.date}`);
+    }
+    if (day.max_wind_speed > maxWindDay.speed) {
+      maxWindDay = { speed: day.max_wind_speed, date: day.date };
+    }
+  });
+
+  if (maxWindDay.speed > 12) {
+    alerts.push(`High winds up to ${maxWindDay.speed} m/s expected on ${maxWindDay.date}`);
+  }
+
+  // Сравниваем базовую модель и GFS на ближайшие часы
+  let modelComparison = "Main forecast matches global trends.";
+  if (hourly.length > 0 && gfs.length > 0) {
+    const mainTempAhead = hourly[12]?.temp;
+    const gfsTempAhead = gfs[12];
+    if (mainTempAhead && gfsTempAhead) {
+      const diff = Math.abs(mainTempAhead - gfsTempAhead).toFixed(1);
+      if (diff > 1.5) {
+        modelComparison = `Model variance detected: GFS predicts ${gfsTempAhead}°C while ECMWF/BestMatch shows ${mainTempAhead}°C in 12 hours.`;
+      } else {
+        modelComparison = `High model consensus: GFS and main forecast temperatures align closely (${mainTempAhead}°C vs ${gfsTempAhead}°C).`;
       }
-    } catch (e) {
-      console.warn(`AI Provider ${i + 1} failed, trying next...`);
     }
   }
 
-  return "All free AI systems are currently overloaded. Please try again in a few minutes.";
+  // Строим финальный текст
+  const alertText = alerts.length > 0 ? `⚠️ ALERTS: ${alerts.join('. ')}.` : "✅ No severe weather alerts for the upcoming days.";
+  const tip = current.temp > 25 ? "Wear lightweight clothing and stay hydrated." : current.temp < 10 ? "Dress warmly and watch out for wind chill." : "Weather is moderate, standard seasonal clothing recommended.";
+
+  return `[Local AI Engine]: Currently it's ${current.temp}°C, feels like ${current.feels_like}°C with ${current.condition}. ${alertText} ${modelComparison} Practical tip: ${tip}`;
 }
 
 export async function GET(request) {
@@ -147,11 +132,27 @@ export async function GET(request) {
 
     let aiText = null;
     if (needAI) {
-      const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief, smart summary in English. Alert about dangerous weather (thunderstorms, high winds), compare main forecast with GFS model, and give a practical tip for today.";
-      const userPrompt = JSON.stringify(weatherData);
-      
-      // Вызываем каскадный опрос моделей
-      aiText = await fetchAIAnalysisWithFallback(systemPrompt, userPrompt);
+      try {
+        // Пробуем достучаться до бесплатной Llama
+        const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief, smart summary in English. Alert about dangerous weather (thunderstorms, high winds), compare main forecast with GFS model, and give a practical tip for today.";
+        const res = await fetch(`https://text.pollinations.ai/${encodeURIComponent(systemPrompt + "\n\n" + JSON.stringify(weatherData))}?model=searchshadow&cache=false`, {
+          signal: AbortSignal.timeout(5000)
+        });
+        
+        if (res.ok) {
+          const txt = await res.text();
+          if (txt && !txt.includes('overloaded') && !txt.includes('unavailable')) {
+            aiText = txt;
+          }
+        }
+      } catch (e) {
+        console.log("External AI failed, using built-in generator...");
+      }
+
+      // Фолбек: если ИИ упал, генерируем качественную сводку прямо на сервере
+      if (!aiText) {
+        aiText = generateLocalAnalysis(weatherData);
+      }
     }
 
     return NextResponse.json({
@@ -165,4 +166,4 @@ export async function GET(request) {
       { status: 500 }
     );
   }
-    }
+          }
