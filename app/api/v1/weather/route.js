@@ -38,12 +38,12 @@ function getWindDirection(degrees) {
   return directions[index];
 }
 
-// Обновленный встроенный генератор аналитики
+// Теперь возвращает структурированный объект вместо строки
 function generateLocalAnalysis(weatherData) {
   const current = weatherData.current;
   const daily = weatherData.daily || [];
   const hourly = weatherData.hourly || [];
-  const gfs = weatherData.models_raw?.gfs_hourly_temp || [];
+  const gfs = weatherData.models?.gfs?.hourly_temp || [];
 
   let alerts = [];
   let maxWindDay = { speed: 0, date: '' };
@@ -71,17 +71,21 @@ function generateLocalAnalysis(weatherData) {
     if (mainTempAhead && gfsTempAhead) {
       const diff = Math.abs(mainTempAhead - gfsTempAhead).toFixed(1);
       if (diff > 1.5) {
-        modelComparison = `Model variance detected: GFS predicts ${gfsTempAhead}°C while ECMWF/BestMatch shows ${mainTempAhead}°C in 12 hours.`;
+        modelComparison = `Model variance detected: GFS predicts ${gfsTempAhead}°C while ECMWF shows ${mainTempAhead}°C in 12 hours.`;
       } else {
         modelComparison = `High model consensus: GFS and main forecast temperatures align closely (${mainTempAhead}°C vs ${gfsTempAhead}°C).`;
       }
     }
   }
 
-  const alertText = alerts.length > 0 ? `⚠️ ALERTS: ${alerts.join('. ')}.` : "✅ No severe weather alerts for the upcoming days.";
-  const tip = current.temp > 25 ? "Wear lightweight clothing and stay hydrated." : current.temp < 10 ? "Dress warmly and watch out for wind chill." : "Weather is moderate, standard seasonal clothing recommended.";
+  const summary = `Currently it's ${current.temp}°C, feels like ${current.feels_like}°C with ${current.condition.text}. ${modelComparison}`;
+  const tip = current.temp > 25 ? "Wear lightweight clothing and stay hydrated." : current.temp < 10 ? "Dress warmly and watch out for wind chill." : "Standard seasonal clothing recommended.";
 
-  return `[Local AI Engine]: Currently it's ${current.temp}°C, feels like ${current.feels_like}°C with ${current.condition.text}. ${alertText} ${modelComparison} Practical tip: ${tip}`;
+  return {
+    summary,
+    alerts,
+    tip
+  };
 }
 
 export async function GET(request) {
@@ -106,7 +110,6 @@ export async function GET(request) {
     const hourlyTimes = data.hourly?.time || [];
     const dailyTimes = data.daily?.time || [];
 
-    // Унифицированный маппинг часов (объект wind внутри)
     const hourlyForecast = hourlyTimes.slice(0, 24).map((time, idx) => ({
       time,
       temp: data.hourly?.temperature_2m?.[idx] ?? data.hourly?.temperature_2m_best_match?.[idx] ?? null,
@@ -116,7 +119,6 @@ export async function GET(request) {
       }
     }));
 
-    // Унифицированный маппинг дней (объект wind внутри)
     const dailyForecast = dailyTimes.map((date, idx) => ({
       date,
       temp_max: data.daily?.temperature_2m_max?.[idx] ?? data.daily?.temperature_2m_max_best_match?.[idx] ?? null,
@@ -134,9 +136,8 @@ export async function GET(request) {
         lon: data.longitude, 
         timezone: data.timezone, 
         elevation: data.elevation,
-        generated_at: new Date().toISOString() // Добавили таймстемп
+        generated_at: new Date().toISOString()
       },
-      // Справочник единиц измерения
       units: {
         temp: "°C",
         wind_speed: "m/s",
@@ -155,15 +156,19 @@ export async function GET(request) {
       },
       hourly: hourlyForecast,
       daily: dailyForecast,
-      models_raw: {
-        gfs_hourly_temp: data.hourly?.temperature_2m_gfs_seamless?.slice(0, 24) || null
+      // Красивое структурирование моделей
+      models: {
+        gfs: {
+          hourly_temp: data.hourly?.temperature_2m_gfs_seamless?.slice(0, 24) || null
+        }
       }
     };
 
-    let aiText = null;
+    let aiAnalysisObj = null;
     if (needAI) {
+      let externalRawText = null;
       try {
-        const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief, smart summary in English.";
+        const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief summary, list of alerts, and a practical tip in valid JSON format matching fields: summary, alerts (array), tip.";
         const res = await fetch(`https://text.pollinations.ai/${encodeURIComponent(systemPrompt + "\n\n" + JSON.stringify(weatherData))}?model=searchshadow&cache=false`, {
           signal: AbortSignal.timeout(5000)
         });
@@ -171,21 +176,32 @@ export async function GET(request) {
         if (res.ok) {
           const txt = await res.text();
           if (txt && !txt.includes('overloaded') && !txt.includes('unavailable')) {
-            aiText = txt;
+            // Пробуем распарсить внешний ИИ, если он прислал JSON
+            try {
+              const cleanedTxt = txt.substring(txt.indexOf('{'), txt.lastIndexOf('}') + 1);
+              aiAnalysisObj = JSON.parse(cleanedTxt);
+            } catch {
+              externalRawText = txt;
+            }
           }
         }
       } catch (e) {
-        console.log("External AI failed, using built-in generator...");
+        console.log("External AI fetch omitted or failed.");
       }
 
-      if (!aiText) {
-        aiText = generateLocalAnalysis(weatherData);
+      // Если внешнего JSON нет или он упал — накатываем наш структурированный фолбек
+      if (!aiAnalysisObj) {
+        if (externalRawText) {
+          aiAnalysisObj = { summary: externalRawText, alerts: [], tip: "Review full data for recommendations." };
+        } else {
+          aiAnalysisObj = generateLocalAnalysis(weatherData);
+        }
       }
     }
 
     return NextResponse.json({
       weather: weatherData,
-      ...(needAI && { ai_analysis: aiText })
+      ...(needAI && { ai_analysis: aiAnalysisObj })
     });
 
   } catch (error) {
@@ -194,4 +210,4 @@ export async function GET(request) {
       { status: 500 }
     );
   }
-    }
+  }
