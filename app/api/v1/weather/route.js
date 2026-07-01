@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 
-// 1. Словарь для перевода кодов погоды WMO в понятный английский текст
 const WEATHER_CODES = {
   0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
   45: 'Fog', 48: 'Depositing rime fog',
@@ -17,8 +16,8 @@ function getWeatherDesc(code) {
   return WEATHER_CODES[code] || 'Unknown conditions';
 }
 
-// 2. Перевод градусов ветра (0°-360°) в направления (N, NE, E...)
 function getWindDirection(degrees) {
+  if (degrees === undefined || degrees === null) return 'N/A';
   const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
   const index = Math.round(((degrees % 360) / 45)) % 8;
   return directions[index];
@@ -26,11 +25,11 @@ function getWindDirection(degrees) {
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
-  const lat = searchParams.get('lat') || '55.75'; // По дефолту Москва
+  const lat = searchParams.get('lat') || '55.75';
   const lon = searchParams.get('lon') || '37.62';
 
   try {
-    // Собираем URL: запрашиваем 14 дней, текущую, почасовую, ежедневную погоду + мультимодели прогноза
+    // Запрашиваем основную модель (best_match) + дополнительные для ИИ
     const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m` +
       `&hourly=temperature_2m,weather_code,wind_speed_10m` +
@@ -39,7 +38,6 @@ export async function GET(request) {
       `&models=best_match,ecmwf_ifs04,gfs_seamless` +
       `&timezone=auto`;
 
-    // Next.js кеширует этот fetch запрос на 15 минут (900 секунд) автоматически
     const response = await fetch(openMeteoUrl, {
       next: { revalidate: 900 },
     });
@@ -50,25 +48,44 @@ export async function GET(request) {
 
     const data = await response.json();
 
-    // 3. Форматируем почасовой прогноз на ближайшие 24 часа
-    const hourlyForecast = data.hourly.time.slice(0, 24).map((time, idx) => ({
-      time,
-      temp: data.hourly.temperature_2m[idx],
-      condition: getWeatherDesc(data.hourly.weather_code[idx]),
-      wind_speed: data.hourly.wind_speed_10m[idx],
-    }));
+    // Проверяем наличие базовых массивов, чтобы избежать краша
+    const hourlyTimes = data.hourly?.time || [];
+    const dailyTimes = data.daily?.time || [];
 
-    // 4. Форматируем прогноз на 14 дней
-    const dailyForecast = data.daily.time.map((date, idx) => ({
-      date,
-      temp_max: data.daily.temperature_2m_max[idx],
-      temp_min: data.daily.temperature_2m_min[idx],
-      condition: getWeatherDesc(data.daily.weather_code[idx]),
-      max_wind_speed: data.daily.wind_speed_10m_max[idx],
-      wind_dir: getWindDirection(data.daily.wind_direction_10m_dominant[idx]),
-    }));
+    // Безопасно собираем почасовой прогноз (первые 24 часа)
+    const hourlyForecast = hourlyTimes.slice(0, 24).map((time, idx) => {
+      // Если из-за мультимоделей ключи называются иначе, ищем их динамически или берем дефолтные
+      const temp = data.hourly?.temperature_2m?.[idx] ?? data.hourly?.temperature_2m_best_match?.[idx] ?? null;
+      const code = data.hourly?.weather_code?.[idx] ?? data.hourly?.weather_code_best_match?.[idx] ?? 0;
+      const wind = data.hourly?.wind_speed_10m?.[idx] ?? data.hourly?.wind_speed_10m_best_match?.[idx] ?? null;
 
-    // 5. Собираем чистый JSON-ответ для фронтенда или ИИ-анализатора
+      return {
+        time,
+        temp,
+        condition: getWeatherDesc(code),
+        wind_speed: wind,
+      };
+    });
+
+    // Безопасно собираем прогноз на 14 дней
+    const dailyForecast = dailyTimes.map((date, idx) => {
+      const maxTemp = data.daily?.temperature_2m_max?.[idx] ?? data.daily?.temperature_2m_max_best_match?.[idx] ?? null;
+      const minTemp = data.daily?.temperature_2m_min?.[idx] ?? data.daily?.temperature_2m_min_best_match?.[idx] ?? null;
+      const code = data.daily?.weather_code?.[idx] ?? data.daily?.weather_code_best_match?.[idx] ?? 0;
+      const maxWind = data.daily?.wind_speed_10m_max?.[idx] ?? data.daily?.wind_speed_10m_max_best_match?.[idx] ?? null;
+      const windDeg = data.daily?.wind_direction_10m_dominant?.[idx] ?? data.daily?.wind_direction_10m_dominant_best_match?.[idx] ?? 0;
+
+      return {
+        date,
+        temp_max: maxTemp,
+        temp_min: minTemp,
+        condition: getWeatherDesc(code),
+        max_wind_speed: maxWind,
+        wind_dir: getWindDirection(windDeg),
+      };
+    });
+
+    // Формируем финальный ответ
     const responseData = {
       meta: {
         lat: data.latitude,
@@ -77,22 +94,26 @@ export async function GET(request) {
         elevation: data.elevation,
       },
       current: {
-        temp: data.current.temperature_2m,
-        feels_like: data.current.apparent_temperature,
-        humidity: data.current.relative_humidity_2m,
-        condition: getWeatherDesc(data.current.weather_code),
+        temp: data.current?.temperature_2m ?? data.current?.temperature_2m_best_match,
+        feels_like: data.current?.apparent_temperature ?? data.current?.apparent_temperature_best_match,
+        humidity: data.current?.relative_humidity_2m ?? data.current?.relative_humidity_2m_best_match,
+        condition: getWeatherDesc(data.current?.weather_code ?? data.current?.weather_code_best_match),
         wind: {
-          speed: data.current.wind_speed_10m,
-          deg: data.current.wind_direction_10m,
-          direction: getWindDirection(data.current.wind_direction_10m),
+          speed: data.current?.wind_speed_10m ?? data.current?.wind_speed_10m_best_match,
+          deg: data.current?.wind_direction_10m ?? data.current?.wind_direction_10m_best_match,
+          direction: getWindDirection(data.current?.wind_direction_10m ?? data.current?.wind_direction_10m_best_match),
         }
       },
       hourly: hourlyForecast,
       daily: dailyForecast,
-      // Сырые срезы данных от разных моделей для сравнения ИИ
+      // Сохраняем сырые данные моделей, если они пришли в ответе
       models_raw: {
-        ecmwf: data.current_ecmwf_ifs04 || null,
-        gfs: data.current_gfs_seamless || null,
+        ecmwf: data.hourly?.temperature_2m_ecmwf_ifs04 ? {
+          hourly_temp: data.hourly.temperature_2m_ecmwf_ifs04.slice(0, 24)
+        } : null,
+        gfs: data.hourly?.temperature_2m_gfs_seamless ? {
+          hourly_temp: data.hourly.temperature_2m_gfs_seamless.slice(0, 24)
+        } : null,
       }
     };
 
@@ -104,4 +125,4 @@ export async function GET(request) {
       { status: 500 }
     );
   }
-}
+      }
