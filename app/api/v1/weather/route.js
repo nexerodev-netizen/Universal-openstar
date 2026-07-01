@@ -23,16 +23,77 @@ function getWindDirection(degrees) {
   return directions[index];
 }
 
+// Хелпер для поочередного опроса бесплатных ИИ шлюзов
+async function fetchAIAnalysisWithFallback(systemPrompt, userPrompt) {
+  const fullPrompt = `${systemPrompt}\n\nData to analyze:\n${userPrompt}`;
+  
+  // Пул бесплатных независимых провайдеров
+  const providers = [
+    // Провайдер 1: Pollinations (POST)
+    async () => {
+      const res = await fetch('https://text.pollinations.ai/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+          model: 'llama',
+          private: true
+        }),
+        signal: AbortSignal.timeout(6000) // таймаут 6 секунд
+      });
+      if (!res.ok) throw new Error('Pollinations failed');
+      const txt = await res.text();
+      if (txt.includes('temporary unavailable')) throw new Error('Pollinations rate limit');
+      return txt;
+    },
+    // Провайдер 2: Pollinations GET-шлюз (с другим распределением нагрузки)
+    async () => {
+      const encodedPrompt = encodeURIComponent(fullPrompt);
+      const res = await fetch(`https://text.pollinations.ai/${encodedPrompt}?model=searchshadow&cache=false`, {
+        signal: AbortSignal.timeout(6000)
+      });
+      if (!res.ok) throw new Error('Pollinations GET failed');
+      return await res.text();
+    },
+    // Провайдер 3: Ускоренный резервный текстовый инстанс (Llama-3-free)
+    async () => {
+      const res = await fetch('https://text.pollinations.ai/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: fullPrompt }],
+          model: 'mistral',
+          private: true
+        }),
+        signal: AbortSignal.timeout(6000)
+      });
+      if (!res.ok) throw new Error('Mistral fallback failed');
+      return await res.text();
+    }
+  ];
+
+  // Перебираем провайдеров по очереди, пока один не ответит успешно
+  for (let i = 0; i < providers.length; i++) {
+    try {
+      const result = await providers[i]();
+      if (result && result.trim().length > 10) {
+        return result; // Возвращаем успешный ответ
+      }
+    } catch (e) {
+      console.warn(`AI Provider ${i + 1} failed, trying next...`);
+    }
+  }
+
+  return "All free AI systems are currently overloaded. Please try again in a few minutes.";
+}
+
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const lat = searchParams.get('lat') || '55.75';
   const lon = searchParams.get('lon') || '37.62';
-  
-  // Проверяем параметр: если передали ?ai=true, то включаем ИИ-аналитику
   const needAI = searchParams.get('ai') === 'true';
 
   try {
-    // 1. Запрос напрямую в Open-Meteo
     const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m` +
       `&hourly=temperature_2m,weather_code,wind_speed_10m` +
@@ -48,7 +109,6 @@ export async function GET(request) {
     const hourlyTimes = data.hourly?.time || [];
     const dailyTimes = data.daily?.time || [];
 
-    // Форматируем часы (ближайшие 24 часа)
     const hourlyForecast = hourlyTimes.slice(0, 24).map((time, idx) => ({
       time,
       temp: data.hourly?.temperature_2m?.[idx] ?? data.hourly?.temperature_2m_best_match?.[idx] ?? null,
@@ -56,7 +116,6 @@ export async function GET(request) {
       wind_speed: data.hourly?.wind_speed_10m?.[idx] ?? data.hourly?.wind_speed_10m_best_match?.[idx] ?? null,
     }));
 
-    // Форматируем 14 дней
     const dailyForecast = dailyTimes.map((date, idx) => ({
       date,
       temp_max: data.daily?.temperature_2m_max?.[idx] ?? data.daily?.temperature_2m_max_best_match?.[idx] ?? null,
@@ -66,7 +125,6 @@ export async function GET(request) {
       wind_dir: getWindDirection(data.daily?.wind_direction_10m_dominant?.[idx] ?? data.daily?.wind_direction_10m_dominant_best_match?.[idx] ?? 0),
     }));
 
-    // Собираем чистый объект погоды
     const weatherData = {
       meta: { lat: data.latitude, lon: data.longitude, timezone: data.timezone, elevation: data.elevation },
       current: {
@@ -87,37 +145,15 @@ export async function GET(request) {
       }
     };
 
-    // 2. Если нужен ИИ-анализ, делаем запрос к бесплатной Llama 3
     let aiText = null;
     if (needAI) {
-      try {
-        const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief, smart summary in English. Alert about dangerous weather (thunderstorms, high winds), compare main forecast with GFS model, and give a practical tip for today.";
-        
-        const aiResponse = await fetch('https://text.pollinations.ai/', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: `Weather JSON Data:\n${JSON.stringify(weatherData)}` }
-            ],
-            model: 'llama',
-            private: true
-          }),
-          next: { revalidate: 900 }
-        });
-
-        if (aiResponse.ok) {
-          aiText = await aiResponse.text();
-        } else {
-          aiText = "AI analysis temporary unavailable due to external service load.";
-        }
-      } catch (aiErr) {
-        aiText = `AI processing failed: ${aiErr.message}`;
-      }
+      const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief, smart summary in English. Alert about dangerous weather (thunderstorms, high winds), compare main forecast with GFS model, and give a practical tip for today.";
+      const userPrompt = JSON.stringify(weatherData);
+      
+      // Вызываем каскадный опрос моделей
+      aiText = await fetchAIAnalysisWithFallback(systemPrompt, userPrompt);
     }
 
-    // Возвращаем результат в зависимости от того, запрашивали ли ИИ
     return NextResponse.json({
       weather: weatherData,
       ...(needAI && { ai_analysis: aiText })
@@ -129,4 +165,4 @@ export async function GET(request) {
       { status: 500 }
     );
   }
-               }
+    }
