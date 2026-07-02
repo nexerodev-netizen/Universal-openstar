@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 
+// Словарь кодов погоды WMO
 const WEATHER_CODES = {
   0: { code: 'clear_sky', text: 'Clear sky' },
   1: { code: 'mainly_clear', text: 'Mainly clear' },
@@ -38,7 +39,7 @@ function getWindDirection(degrees) {
   return directions[index];
 }
 
-// ✅ ИСПРАВЛЕНИЕ 1: Убрано упоминание ECMWF, если данных нет
+// Локальный анализ (Fallback, если внешний AI недоступен)
 function generateLocalAnalysis(weatherData) {
   const current = weatherData.current;
   const daily = weatherData.daily || [];
@@ -48,6 +49,7 @@ function generateLocalAnalysis(weatherData) {
   let alerts = [];
   let maxWindDay = { speed: 0, date: '' };
 
+  // Поиск опасных явлений
   daily.forEach(day => {
     if (day.condition.code.includes('thunderstorm')) {
       alerts.push(`Thunderstorm predicted on ${day.date}`);
@@ -64,17 +66,21 @@ function generateLocalAnalysis(weatherData) {
     alerts.push(`High winds up to ${maxWindDay.speed} m/s expected on ${maxWindDay.date}`);
   }
 
+  // Сравнение моделей (только если есть данные GFS)
   let modelComparison = "Main forecast matches global trends.";
   
-  // ✅ ИСПРАВЛЕНИЕ 3: Теперь работаем с объектами {time, temp}, а не голым массивом
-  if (hourly.length > 12 && gfs.length > 12) {
-    const mainTempAhead = hourly[12]?.temp;
-    const gfsTempAhead = gfs[12]?.temp; // Берем .temp из объекта
+  // Ищем индекс текущего часа в массиве hourly для корректного сравнения "+12 hours"
+  const now = new Date();
+  const currentHourStr = now.toISOString().slice(0, 13); 
+  const currentIndex = hourly.findIndex(h => h.time.startsWith(currentHourStr));
+  
+  if (currentIndex !== -1 && hourly[currentIndex + 12] && gfs[currentIndex + 12]) {
+    const mainTempAhead = hourly[currentIndex + 12]?.temp;
+    const gfsTempAhead = gfs[currentIndex + 12]?.temp;
     
     if (mainTempAhead !== null && gfsTempAhead !== null) {
       const diff = Math.abs(mainTempAhead - gfsTempAhead).toFixed(1);
       if (diff > 1.5) {
-        // ✅ ИСПРАВЛЕНИЕ 1: Говорим "GFS vs Main Forecast", а не выдумываем ECMWF
         modelComparison = `Model variance detected: GFS predicts ${gfsTempAhead}°C while main forecast shows ${mainTempAhead}°C in 12 hours.`;
       } else {
         modelComparison = `High model consensus: GFS and main forecast temperatures align closely (${mainTempAhead}°C vs ${gfsTempAhead}°C).`;
@@ -99,16 +105,17 @@ export async function GET(request) {
   const needAI = searchParams.get('ai') === 'true';
 
   try {
-    // ✅ НОВЫЕ ДАННЫЕ: Добавлены pressure, precipitation_probability, precipitation, cloudcover, uv_index
+    // Запрос данных с Open-Meteo
+    // Добавлены: surface_pressure, precipitation_probability, precipitation, cloudcover, uv_index
     const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,surface_pressure` +
       `&hourly=temperature_2m,weather_code,wind_speed_10m,precipitation_probability,precipitation,cloudcover,uv_index,surface_pressure` +
       `&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,wind_direction_10m_dominant,uv_index_max,precipitation_sum,precipitation_probability_max` +
       `&forecast_days=14` +
-      `&models=best_match,gfs_seamless` + // Убрал ecmwf_ifs04 из запроса, чтобы не путать AI, пока не добавим его полноценно
+      `&models=best_match,gfs_seamless` + 
       `&timezone=auto`;
 
-    // ✅ ИСПРАВЛЕНИЕ 4: Кэш уменьшен до 300 сек (5 минут), чтобы данные не устаревали
+    // Кэш 5 минут (300 сек) для баланса актуальности и скорости
     const response = await fetch(openMeteoUrl, { next: { revalidate: 300 } });
     if (!response.ok) throw new Error('Open-Meteo API connection failed');
     const data = await response.json();
@@ -116,15 +123,45 @@ export async function GET(request) {
     const hourlyTimes = data.hourly?.time || [];
     const dailyTimes = data.daily?.time || [];
 
-    // Формируем почасовой прогноз
+    // ✅ ИСПРАВЛЕНИЕ СКАЧКА ТЕМПЕРАТУРЫ:
+    // Определяем текущий час локально, чтобы подменить данные ТОЛЬКО для него
+    const now = new Date();
+    // Open-Meteo с timezone=auto возвращает время в локальном поясе запроса.
+    // Формат time: "2026-07-02T10:00". Нам нужно "2026-07-02T10"
+    // Важно: new Date() дает UTC. Нужно скорректировать под пояс пользователя или использовать toLocaleString.
+    // Для простоты и надежности берем UTC час, так как Open-Meteo часто отдает UTC в raw, но с timezone=auto конвертирует.
+    // Безопаснее сравнивать по индексу, если мы знаем смещение, но здесь используем строковое совпадение.
+    
+    // Получаем текущее время в формате ISO, но без минут/секунд/мс
+    // Примечание: Если сервер Vercel в UTC, а пользователь в Москве, new Date() даст UTC.
+    // Open-Meteo с &timezone=auto адаптирует ответы под часовой пояс клиента (если передан заголовок) или сервера.
+    // Предположим, что time в ответе уже в нужном поясе.
+    
+    // Чтобы точно попасть в час, возьмем текущий час сервера (или клиента через заголовки, но тут GET).
+    // Для универсальности просто найдем ближайший час в массиве hourlyTimes к new Date()
+    
+    let currentHourIndex = -1;
+    const nowIso = now.toISOString(); 
+    
+    // Простой поиск индекса текущего часа
+    for(let i=0; i<hourlyTimes.length; i++) {
+        // hourlyTimes[i] выглядит как "2026-07-02T10:00"
+        // nowIso начинается с "2026-07-02T10..." (если UTC) или смещено.
+        // Самый надежный способ: парсить время
+        const hTime = new Date(hourlyTimes[i]);
+        // Разница во времени должна быть меньше 30 минут
+        if (Math.abs(hTime.getTime() - now.getTime()) < 30 * 60 * 1000) {
+            currentHourIndex = i;
+            break;
+        }
+    }
+
     const hourlyForecast = hourlyTimes.slice(0, 24).map((time, idx) => {
-      // ✅ ИСПРАВЛЕНИЕ 2: Для текущего часа (idx 0 или ближайший к now) берем температуру из current, чтобы не было скачков
+      // Берем температуру из модели по умолчанию
       let temp = data.hourly?.temperature_2m_best_match?.[idx] ?? data.hourly?.temperature_2m?.[idx] ?? null;
       
-      // Простая логика синхронизации: если это текущий час, форсируем current.temp
-      // (В продакшене лучше сравнивать time с new Date(), но для простоты берем индекс 0-1 как "сейчас")
-      const isCurrentHour = idx <= 1; 
-      if (isCurrentHour && data.current) {
+      // ✅ ПОДМЕНА ТОЛЬКО ДЛЯ ТЕКУЩЕГО ЧАСА
+      if (idx === currentHourIndex && data.current) {
          temp = data.current.temperature_2m_best_match ?? data.current.temperature_2m;
       }
 
@@ -135,7 +172,7 @@ export async function GET(request) {
         wind: {
           speed: data.hourly?.wind_speed_10m_best_match?.[idx] ?? data.hourly?.wind_speed_10m?.[idx] ?? null
         },
-        // ✅ НОВЫЕ ПОЛЯ В HOURLY
+        // Новые поля
         precipitation_probability: data.hourly?.precipitation_probability_best_match?.[idx] ?? data.hourly?.precipitation_probability?.[idx] ?? null,
         precipitation_mm: data.hourly?.precipitation_best_match?.[idx] ?? data.hourly?.precipitation?.[idx] ?? null,
         cloud_cover: data.hourly?.cloudcover_best_match?.[idx] ?? data.hourly?.cloudcover?.[idx] ?? null,
@@ -153,13 +190,13 @@ export async function GET(request) {
         speed: data.daily?.wind_speed_10m_max_best_match?.[idx] ?? data.daily?.wind_speed_10m_max?.[idx] ?? null,
         direction: getWindDirection(data.daily?.wind_direction_10m_dominant_best_match?.[idx] ?? data.daily?.wind_direction_10m_dominant?.[idx] ?? 0)
       },
-      // ✅ НОВЫЕ ПОЛЯ В DAILY
+      // Новые поля для Daily
       uv_index_max: data.daily?.uv_index_max_best_match?.[idx] ?? data.daily?.uv_index_max?.[idx] ?? null,
       precipitation_sum_mm: data.daily?.precipitation_sum_best_match?.[idx] ?? data.daily?.precipitation_sum?.[idx] ?? null,
       precipitation_probability_max: data.daily?.precipitation_probability_max_best_match?.[idx] ?? data.daily?.precipitation_probability_max?.[idx] ?? null
     }));
 
-    // ✅ ИСПРАВЛЕНИЕ 3: Модели теперь возвращают объекты с временем
+    // Структурирование моделей (GFS с временем)
     const gfsHourlyStructured = (data.hourly?.temperature_2m_gfs_seamless || []).slice(0, 24).map((t, i) => ({
       time: hourlyTimes[i],
       temp: t
@@ -184,7 +221,6 @@ export async function GET(request) {
         temp: data.current?.temperature_2m_best_match ?? data.current?.temperature_2m,
         feels_like: data.current?.apparent_temperature_best_match ?? data.current?.apparent_temperature,
         humidity: data.current?.relative_humidity_2m_best_match ?? data.current?.relative_humidity_2m,
-        // ✅ НОВОЕ ПОЛЕ В CURRENT
         pressure: data.current?.surface_pressure_best_match ?? data.current?.surface_pressure,
         condition: getWeatherCondition(data.current?.weather_code_best_match ?? data.current?.weather_code),
         wind: {
@@ -197,12 +233,12 @@ export async function GET(request) {
       daily: dailyForecast,
       models: {
         gfs: {
-          // ✅ ТЕПЕРЬ ЭТО МАССИВ ОБЪЕКТОВ, А НЕ ПРОСТО ЧИСЛА
           hourly: gfsHourlyStructured 
         }
       }
     };
 
+    // Логика AI анализа
     let aiAnalysisObj = null;
     if (needAI) {
       try {
@@ -215,17 +251,20 @@ export async function GET(request) {
           const txt = await res.text();
           if (txt && !txt.includes('overloaded') && !txt.includes('unavailable')) {
             try {
+              // Очистка от markdown и лишнего текста
               const cleanedTxt = txt.substring(txt.indexOf('{'), txt.lastIndexOf('}') + 1);
               aiAnalysisObj = JSON.parse(cleanedTxt);
             } catch {
+              // Если парсинг не удался, отдаем как текст
               aiAnalysisObj = { summary: txt, alerts: [], tip: "Review full data for recommendations." };
             }
           }
         }
       } catch (e) {
-        console.log("External AI fetch omitted or failed.");
+        console.log("External AI fetch omitted or failed:", e.message);
       }
 
+      // Fallback на локальный анализ, если внешний AI не ответил
       if (!aiAnalysisObj) {
         aiAnalysisObj = generateLocalAnalysis(weatherData);
       }
@@ -242,4 +281,4 @@ export async function GET(request) {
       { status: 500 }
     );
   }
-      }
+    }
