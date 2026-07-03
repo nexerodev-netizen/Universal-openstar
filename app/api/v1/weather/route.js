@@ -1,255 +1,553 @@
 import { NextResponse } from 'next/server';
+import { unstable_cache } from 'next/cache';
+import { randomUUID } from 'crypto';
 
-// Словарь кодов погоды WMO
-const WEATHER_CODES = {
-  0: { code: 'clear_sky', text: 'Clear sky' },
-  1: { code: 'mainly_clear', text: 'Mainly clear' },
-  2: { code: 'partly_cloudy', text: 'Partly cloudy' },
-  3: { code: 'overcast', text: 'Overcast' },
-  45: { code: 'fog', text: 'Fog' },
-  48: { code: 'depositing_rime_fog', text: 'Depositing rime fog' },
-  51: { code: 'light_drizzle', text: 'Light drizzle' },
-  53: { code: 'moderate_drizzle', text: 'Moderate drizzle' },
-  55: { code: 'dense_drizzle', text: 'Dense drizzle' },
-  61: { code: 'slight_rain', text: 'Slight rain' },
-  63: { code: 'moderate_rain', text: 'Moderate rain' },
-  65: { code: 'heavy_rain', text: 'Heavy rain' },
-  71: { code: 'slight_snow', text: 'Slight snow' },
-  73: { code: 'moderate_snow', text: 'Moderate snow' },
-  75: { code: 'heavy_snow', text: 'Heavy snow' },
-  77: { code: 'snow_grains', text: 'Snow grains' },
-  80: { code: 'slight_rain_showers', text: 'Slight rain showers' },
-  81: { code: 'moderate_rain_showers', text: 'Moderate rain showers' },
-  82: { code: 'violent_rain_showers', text: 'Violent rain showers' },
-  85: { code: 'slight_snow_showers', text: 'Slight snow showers' },
-  86: { code: 'heavy_snow_showers', text: 'Heavy snow showers' },
-  95: { code: 'thunderstorm', text: 'Thunderstorm' },
-  96: { code: 'thunderstorm_with_slight_hail', text: 'Thunderstorm with slight hail' },
-  99: { code: 'thunderstorm_with_heavy_hail', text: 'Thunderstorm with heavy hail' }
+export const dynamic = 'force-dynamic'; // кэшем управляем сами через unstable_cache
+
+const CACHE_TTL_SECONDS = 60; // кэш на 1 минуту
+
+const GEOCODE_URL = 'https://geocoding-api.open-meteo.com/v1/search';
+const REVERSE_GEOCODE_URL = 'https://geocoding-api.open-meteo.com/v1/reverse';
+const FORECAST_URL = 'https://api.open-meteo.com/v1/forecast';
+const AIR_QUALITY_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality';
+const ARCHIVE_URL = 'https://archive-api.open-meteo.com/v1/archive';
+
+/* ============================================================
+   WMO weather codes -> текст/иконка
+   ============================================================ */
+const WMO_CODE_MAP = {
+  0: { text: 'Clear', icon: 'clear_day' },
+  1: { text: 'Mostly Clear', icon: 'mostly_clear_day' },
+  2: { text: 'Partly Cloudy', icon: 'partly_cloudy_day' },
+  3: { text: 'Overcast', icon: 'cloudy' },
+  45: { text: 'Fog', icon: 'fog' },
+  48: { text: 'Depositing Rime Fog', icon: 'fog' },
+  51: { text: 'Light Drizzle', icon: 'drizzle' },
+  53: { text: 'Drizzle', icon: 'drizzle' },
+  55: { text: 'Dense Drizzle', icon: 'drizzle' },
+  56: { text: 'Light Freezing Drizzle', icon: 'sleet' },
+  57: { text: 'Dense Freezing Drizzle', icon: 'sleet' },
+  61: { text: 'Light Rain', icon: 'rain' },
+  63: { text: 'Rain', icon: 'rain' },
+  65: { text: 'Heavy Rain', icon: 'rain' },
+  66: { text: 'Light Freezing Rain', icon: 'sleet' },
+  67: { text: 'Freezing Rain', icon: 'sleet' },
+  71: { text: 'Light Snow', icon: 'snow' },
+  73: { text: 'Snow', icon: 'snow' },
+  75: { text: 'Heavy Snow', icon: 'snow' },
+  77: { text: 'Snow Grains', icon: 'snow' },
+  80: { text: 'Light Rain Showers', icon: 'rain' },
+  81: { text: 'Rain Showers', icon: 'rain' },
+  82: { text: 'Violent Rain Showers', icon: 'rain' },
+  85: { text: 'Light Snow Showers', icon: 'snow' },
+  86: { text: 'Heavy Snow Showers', icon: 'snow' },
+  95: { text: 'Thunderstorm', icon: 'thunderstorm' },
+  96: { text: 'Thunderstorm with Light Hail', icon: 'thunderstorm' },
+  99: { text: 'Thunderstorm with Heavy Hail', icon: 'thunderstorm' },
 };
 
-function getWeatherCondition(code) {
-  return WEATHER_CODES[code] || { code: 'unknown', text: 'Unknown conditions' };
+function resolveCondition(code, isDay = true) {
+  const base = WMO_CODE_MAP[code] ?? { text: 'Unknown', icon: 'unknown' };
+  if (!isDay && (code === 0 || code === 1)) {
+    return { text: base.text, icon: base.icon.replace('_day', '_night') };
+  }
+  if (!isDay && code === 2) {
+    return { text: base.text, icon: 'partly_cloudy_night' };
+  }
+  return base;
 }
 
-function getWindDirection(degrees) {
-  if (degrees === undefined || degrees === null) return 'N/A';
-  const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-  const index = Math.round(((degrees % 360) / 45)) % 8;
-  return directions[index];
+function degToCardinal(deg) {
+  const dirs = [
+    'N', 'NNE', 'NE', 'ENE',
+    'E', 'ESE', 'SE', 'SSE',
+    'S', 'SSW', 'SW', 'WSW',
+    'W', 'WNW', 'NW', 'NNW',
+  ];
+  const idx = Math.round(deg / 22.5) % 16;
+  return dirs[idx];
 }
 
-// Локальный анализ (Fallback)
-function generateLocalAnalysis(weatherData, threshold = 15) {
-  const current = weatherData.current;
-  const daily = weatherData.daily || [];
-  const hourly = weatherData.hourly || [];
-  const gfs = weatherData.models?.gfs?.hourly || [];
+function aqiCategory(usAqi) {
+  if (usAqi === null || usAqi === undefined) return null;
+  if (usAqi <= 50) return 'Good';
+  if (usAqi <= 100) return 'Moderate';
+  if (usAqi <= 150) return 'Unhealthy for Sensitive Groups';
+  if (usAqi <= 200) return 'Unhealthy';
+  if (usAqi <= 300) return 'Very Unhealthy';
+  return 'Hazardous';
+}
 
-  let alerts = [];
-  let maxWindDay = { speed: 0, date: '' };
+const MOON_PHASES = [
+  'New Moon', 'Waxing Crescent', 'First Quarter', 'Waxing Gibbous',
+  'Full Moon', 'Waning Gibbous', 'Last Quarter', 'Waning Crescent',
+];
 
-  daily.forEach(day => {
-    if (day.condition.code.includes('thunderstorm')) alerts.push(`Thunderstorm predicted on ${day.date}`);
-    if (day.condition.code.includes('heavy_rain') || day.condition.code.includes('heavy_snow')) alerts.push(`Heavy precipitation expected on ${day.date}`);
-    if (day.wind.speed > maxWindDay.speed) maxWindDay = { speed: day.wind.speed, date: day.date };
+function moonPhaseForDate(isoDate) {
+  const known = new Date('2000-01-06T18:14:00Z').getTime();
+  const synodic = 29.53058867;
+  const date = new Date(isoDate + 'T12:00:00Z').getTime();
+  const daysSince = (date - known) / 86400000;
+  const phaseIndex = Math.floor(((daysSince % synodic) / synodic) * 8 + 0.5) % 8;
+  return MOON_PHASES[(phaseIndex + 8) % 8];
+}
+
+function round1(n) {
+  return n === null || n === undefined ? null : Math.round(n * 10) / 10;
+}
+
+function formatDateRu(isoDate) {
+  const d = new Date(isoDate + 'T00:00:00');
+  const months = [
+    'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+    'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
+  ];
+  return `${d.getDate()} ${months[d.getMonth()]}`;
+}
+
+/* ============================================================
+   Запросы к Open-Meteo
+   ============================================================ */
+async function fetchJson(url, revalidate = CACHE_TTL_SECONDS) {
+  const res = await fetch(url, { next: { revalidate } });
+  if (!res.ok) {
+    throw new Error(`Upstream request failed: ${res.status} ${res.statusText} (${url})`);
+  }
+  return res.json();
+}
+
+async function geocodeByCity(city) {
+  const url = `${GEOCODE_URL}?name=${encodeURIComponent(city)}&count=1&language=en&format=json`;
+  const data = await fetchJson(url, 60 * 60 * 24);
+  if (!data.results || data.results.length === 0) return null;
+  const r = data.results[0];
+  return { name: r.name, country: r.country, lat: r.latitude, lon: r.longitude, timezone: r.timezone };
+}
+
+async function reverseGeocode(lat, lon) {
+  try {
+    const url = `${REVERSE_GEOCODE_URL}?latitude=${lat}&longitude=${lon}&language=en&format=json`;
+    const data = await fetchJson(url, 60 * 60 * 24);
+    if (data.results && data.results.length > 0) {
+      const r = data.results[0];
+      return { name: r.name, country: r.country, lat: r.latitude, lon: r.longitude, timezone: r.timezone };
+    }
+  } catch {
+    // не критично
+  }
+  return null;
+}
+
+async function fetchWeather(lat, lon, units) {
+  const tempUnit = units === 'imperial' ? 'fahrenheit' : 'celsius';
+  const windUnit = units === 'imperial' ? 'mph' : 'kmh';
+
+  const params = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    temperature_unit: tempUnit,
+    wind_speed_unit: windUnit,
+    timezone: 'auto',
+    current: [
+      'temperature_2m', 'apparent_temperature', 'relative_humidity_2m', 'weather_code',
+      'wind_speed_10m', 'wind_gusts_10m', 'wind_direction_10m', 'surface_pressure',
+      'cloud_cover', 'dew_point_2m', 'visibility', 'precipitation', 'uv_index', 'is_day',
+    ].join(','),
+    hourly: [
+      'temperature_2m', 'apparent_temperature', 'weather_code', 'precipitation_probability',
+      'relative_humidity_2m', 'wind_speed_10m', 'wind_gusts_10m',
+    ].join(','),
+    daily: [
+      'weather_code', 'temperature_2m_max', 'temperature_2m_min', 'precipitation_probability_max',
+      'uv_index_max', 'wind_speed_10m_max', 'wind_gusts_10m_max', 'sunrise', 'sunset',
+    ].join(','),
+    forecast_days: '14',
   });
 
-  if (maxWindDay.speed > threshold) {
-    alerts.push(`High winds up to ${maxWindDay.speed} m/s expected on ${maxWindDay.date}`);
+  return fetchJson(`${FORECAST_URL}?${params.toString()}`);
+}
+
+async function fetchAirQuality(lat, lon) {
+  const params = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    current: ['pm2_5', 'pm10', 'ozone', 'us_aqi'].join(','),
+    timezone: 'auto',
+  });
+  return fetchJson(`${AIR_QUALITY_URL}?${params.toString()}`);
+}
+
+/** История погоды за ~год — сырьё для сравнения прогноза с климатической нормой */
+async function fetchClimateHistory(lat, lon) {
+  const today = new Date();
+  const end = new Date(today);
+  end.setDate(end.getDate() - 3);
+  const start = new Date(end);
+  start.setFullYear(start.getFullYear() - 1);
+  const fmt = (d) => d.toISOString().slice(0, 10);
+
+  const params = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    start_date: fmt(start),
+    end_date: fmt(end),
+    daily: [
+      'temperature_2m_max', 'temperature_2m_min', 'temperature_2m_mean',
+      'precipitation_sum', 'wind_speed_10m_max', 'wind_gusts_10m_max',
+    ].join(','),
+    timezone: 'auto',
+  });
+
+  return fetchJson(`${ARCHIVE_URL}?${params.toString()}`, 60 * 60 * 24);
+}
+
+/* ============================================================
+   "ИИ"-анализ климата: статистика + текстовые выводы на русском
+   ============================================================ */
+function mean(arr) {
+  if (!arr.length) return null;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function stdDev(arr, avg) {
+  if (arr.length < 2) return 0;
+  const m = avg ?? mean(arr);
+  const variance = arr.reduce((sum, v) => sum + (v - m) ** 2, 0) / arr.length;
+  return Math.sqrt(variance);
+}
+
+function buildClimateStats(archiveDaily) {
+  if (!archiveDaily || !archiveDaily.time) return null;
+
+  const tMax = archiveDaily.temperature_2m_max.filter((v) => v !== null);
+  const tMin = archiveDaily.temperature_2m_min.filter((v) => v !== null);
+  const tMean = archiveDaily.temperature_2m_mean.filter((v) => v !== null);
+  const precip = archiveDaily.precipitation_sum.filter((v) => v !== null);
+  const windMax = archiveDaily.wind_speed_10m_max.filter((v) => v !== null);
+  const gustMax = archiveDaily.wind_gusts_10m_max.filter((v) => v !== null);
+
+  const avgTMean = mean(tMean);
+  const avgWind = mean(windMax);
+  const avgGust = mean(gustMax);
+
+  return {
+    avg_temp_mean: round1(avgTMean),
+    avg_temp_max: round1(mean(tMax)),
+    avg_temp_min: round1(mean(tMin)),
+    temp_std_dev: round1(stdDev(tMean, avgTMean)),
+    avg_daily_precipitation_mm: round1(mean(precip)),
+    rainy_days_ratio: precip.length ? round1((precip.filter((v) => v > 1).length / precip.length) * 100) : null,
+    avg_wind_speed_max: round1(avgWind),
+    wind_std_dev: round1(stdDev(windMax, avgWind)),
+    avg_wind_gust_max: round1(avgGust),
+    sample_days: archiveDaily.time.length,
+    period: { from: archiveDaily.time[0], to: archiveDaily.time[archiveDaily.time.length - 1] },
+  };
+}
+
+function findDailyAnomalies(dailyForecast, climateStats) {
+  const anomalies = [];
+  if (!dailyForecast || !dailyForecast.time) return anomalies;
+
+  const WIND_STRONG = 50; // км/ч
+  const WIND_SEVERE = 70; // км/ч
+
+  for (let i = 0; i < dailyForecast.time.length; i++) {
+    const date = dailyForecast.time[i];
+    const tMax = dailyForecast.temperature_2m_max?.[i];
+    const tMin = dailyForecast.temperature_2m_min?.[i];
+    const gustMax = dailyForecast.wind_gusts_10m_max?.[i];
+    const precipProb = dailyForecast.precipitation_probability_max?.[i];
+
+    if (gustMax !== undefined && gustMax !== null) {
+      if (gustMax >= WIND_SEVERE) {
+        anomalies.push({
+          date, type: 'wind', severity: 'severe',
+          message: `${formatDateRu(date)}: ожидается очень сильный ветер, порывы до ${Math.round(gustMax)} км/ч.`,
+        });
+      } else if (gustMax >= WIND_STRONG) {
+        anomalies.push({
+          date, type: 'wind', severity: 'moderate',
+          message: `${formatDateRu(date)}: ожидается сильный ветер, порывы до ${Math.round(gustMax)} км/ч.`,
+        });
+      }
+    }
+
+    if (climateStats?.avg_temp_max != null && tMax != null) {
+      const diff = tMax - climateStats.avg_temp_max;
+      if (diff >= 7) {
+        anomalies.push({
+          date, type: 'heat', severity: diff >= 12 ? 'severe' : 'moderate',
+          message: `${formatDateRu(date)}: температура до ${Math.round(tMax)}°C — на ${Math.round(diff)}° выше нормы.`,
+        });
+      }
+    }
+    if (climateStats?.avg_temp_min != null && tMin != null) {
+      const diff = climateStats.avg_temp_min - tMin;
+      if (diff >= 7) {
+        anomalies.push({
+          date, type: 'cold', severity: diff >= 12 ? 'severe' : 'moderate',
+          message: `${formatDateRu(date)}: похолодание до ${Math.round(tMin)}°C — заметно ниже нормы.`,
+        });
+      }
+    }
+
+    if (precipProb != null && precipProb >= 70) {
+      anomalies.push({
+        date, type: 'rain', severity: precipProb >= 85 ? 'moderate' : 'low',
+        message: `${formatDateRu(date)}: высокая вероятность осадков (${precipProb}%).`,
+      });
+    }
   }
 
-  // Умное сравнение моделей
-  let modelComparison = "Main forecast matches global trends.";
-  const now = new Date();
-  const currentIndex = hourly.findIndex(h => {
-    const hTime = new Date(h.time);
-    return Math.abs(hTime.getTime() - now.getTime()) < 30 * 60 * 1000;
-  });
-  
-  if (currentIndex !== -1 && hourly[currentIndex + 12] && gfs[currentIndex + 12]) {
-    const mainTempAhead = hourly[currentIndex + 12]?.temp;
-    const gfsTempAhead = gfs[currentIndex + 12]?.temp;
-    
-    if (mainTempAhead !== null && gfsTempAhead !== null) {
-      const diff = Math.abs(mainTempAhead - gfsTempAhead).toFixed(1);
-      if (diff > 1.5) {
-        modelComparison = `Model variance detected: GFS predicts ${gfsTempAhead}°C while main forecast shows ${mainTempAhead}°C in 12 hours.`;
-      } else {
-        modelComparison = `High model consensus: GFS and main forecast temperatures align closely (${mainTempAhead}°C vs ${gfsTempAhead}°C).`;
+  return anomalies;
+}
+
+function buildClimateAnalysis({ dailyForecast, archiveDaily, locationName }) {
+  const climateStats = buildClimateStats(archiveDaily);
+  const anomalies = findDailyAnomalies(dailyForecast, climateStats);
+
+  const forecastAvgMax = dailyForecast?.temperature_2m_max
+    ? round1(mean(dailyForecast.temperature_2m_max.filter((v) => v !== null)))
+    : null;
+  const forecastAvgWindGust = dailyForecast?.wind_gusts_10m_max
+    ? round1(mean(dailyForecast.wind_gusts_10m_max.filter((v) => v !== null)))
+    : null;
+
+  const parts = [];
+
+  if (climateStats && forecastAvgMax !== null && climateStats.avg_temp_max !== null) {
+    const diff = round1(forecastAvgMax - climateStats.avg_temp_max);
+    if (Math.abs(diff) < 1.5) {
+      parts.push(`Температура в ближайшие 14 дней в ${locationName} будет близка к климатической норме (около ${climateStats.avg_temp_max}°C днём).`);
+    } else if (diff > 0) {
+      parts.push(`Ближайшие 14 дней в ${locationName} ожидаются теплее обычного: в среднем на ${diff}°C выше нормы (${climateStats.avg_temp_max}°C).`);
+    } else {
+      parts.push(`Ближайшие 14 дней в ${locationName} ожидаются прохладнее обычного: в среднем на ${Math.abs(diff)}°C ниже нормы (${climateStats.avg_temp_max}°C).`);
+    }
+  }
+
+  const windDays = anomalies.filter((a) => a.type === 'wind');
+  if (windDays.length) parts.push(`Сильный ветер прогнозируется: ${windDays.map((a) => formatDateRu(a.date)).join(', ')}.`);
+
+  const heatDays = anomalies.filter((a) => a.type === 'heat');
+  if (heatDays.length) parts.push(`Аномальная жара ожидается: ${heatDays.map((a) => formatDateRu(a.date)).join(', ')}.`);
+
+  const rainDays = anomalies.filter((a) => a.type === 'rain');
+  if (rainDays.length) parts.push(`Дни с высокой вероятностью дождя: ${rainDays.map((a) => formatDateRu(a.date)).join(', ')}.`);
+
+  if (!parts.length) parts.push('Существенных отклонений от климатической нормы в ближайшие 14 дней не ожидается.');
+
+  return {
+    summary: parts.join(' '),
+    climate_normals: climateStats,
+    forecast_vs_normal: {
+      forecast_avg_temp_max: forecastAvgMax,
+      forecast_avg_wind_gust: forecastAvgWindGust,
+      temp_deviation: climateStats && forecastAvgMax !== null && climateStats.avg_temp_max !== null
+        ? round1(forecastAvgMax - climateStats.avg_temp_max)
+        : null,
+    },
+    daily_warnings: anomalies,
+  };
+}
+
+/* ============================================================
+   Сборка итогового JSON-ответа
+   ============================================================ */
+function buildWeatherResponse({ lat, lon, locationMeta, weatherData, aqiData, climateAnalysis, units, requestId }) {
+  const current = weatherData.current || {};
+  const hourly = weatherData.hourly || {};
+  const daily = weatherData.daily || {};
+  const isDay = current.is_day === 1;
+  const condition = resolveCondition(current.weather_code, isDay);
+  const tempUnit = units === 'imperial' ? '°F' : '°C';
+  const aqiCurrent = aqiData?.current || null;
+
+  const hourlyOut = [];
+  if (hourly.time) {
+    const nowIdx = hourly.time.findIndex((t) => new Date(t) >= new Date());
+    const startIdx = nowIdx >= 0 ? nowIdx : 0;
+    for (let i = startIdx; i < Math.min(startIdx + 24, hourly.time.length); i++) {
+      hourlyOut.push({
+        time: hourly.time[i],
+        temperature: Math.round(hourly.temperature_2m[i]),
+        feels_like: Math.round(hourly.apparent_temperature[i]),
+        condition: resolveCondition(hourly.weather_code[i]).text,
+        precipitation_probability: hourly.precipitation_probability?.[i] ?? null,
+        humidity: hourly.relative_humidity_2m?.[i] ?? null,
+        wind_speed: hourly.wind_speed_10m?.[i] != null ? Math.round(hourly.wind_speed_10m[i]) : null,
+      });
+    }
+  }
+
+  const dailyOut = [];
+  if (daily.time) {
+    for (let i = 0; i < daily.time.length; i++) {
+      const date = daily.time[i];
+      dailyOut.push({
+        date,
+        sunrise: daily.sunrise?.[i] ? daily.sunrise[i].split('T')[1] : undefined,
+        sunset: daily.sunset?.[i] ? daily.sunset[i].split('T')[1] : undefined,
+        moon_phase: moonPhaseForDate(date),
+        temp_min: Math.round(daily.temperature_2m_min[i]),
+        temp_max: Math.round(daily.temperature_2m_max[i]),
+        condition: resolveCondition(daily.weather_code[i]).text,
+        precipitation_probability: daily.precipitation_probability_max?.[i] ?? null,
+        uv_index: daily.uv_index_max?.[i] != null ? round1(daily.uv_index_max[i]) : undefined,
+        wind_speed_max: daily.wind_speed_10m_max?.[i] != null ? Math.round(daily.wind_speed_10m_max[i]) : undefined,
+        wind_gust_max: daily.wind_gusts_10m_max?.[i] != null ? Math.round(daily.wind_gusts_10m_max[i]) : undefined,
+      });
+    }
+  }
+
+  const alerts = [];
+  if (climateAnalysis?.daily_warnings?.length) {
+    for (const w of climateAnalysis.daily_warnings) {
+      if (w.severity === 'severe' || w.severity === 'moderate') {
+        alerts.push({
+          type: w.type === 'wind' ? 'Wind' : w.type === 'heat' ? 'Heat' : w.type === 'cold' ? 'Cold' : 'Rain',
+          severity: w.severity === 'severe' ? 'Severe' : 'Moderate',
+          title: `${w.type === 'wind' ? 'Strong wind' : w.type === 'heat' ? 'Heat' : w.type === 'cold' ? 'Cold snap' : 'Heavy rain'} expected on ${w.date}`,
+          description: w.message,
+        });
       }
     }
   }
 
-  const summary = `Currently it's ${current.temp}°C, feels like ${current.feels_like}°C with ${current.condition.text}. ${modelComparison}`;
-  const tip = current.temp > 25 ? "Wear lightweight clothing and stay hydrated." : current.temp < 10 ? "Dress warmly and watch out for wind chill." : "Standard seasonal clothing recommended.";
-
-  return { summary, alerts, tip };
+  return {
+    location: {
+      name: locationMeta?.name || 'Unknown',
+      country: locationMeta?.country || 'Unknown',
+      lat, lon,
+      timezone: weatherData.timezone || locationMeta?.timezone || 'UTC',
+      local_time: current.time || new Date().toISOString(),
+    },
+    current: {
+      temperature: { value: round1(current.temperature_2m), unit: tempUnit, feels_like: round1(current.apparent_temperature) },
+      condition: { code: current.weather_code, text: condition.text, icon: condition.icon },
+      wind: {
+        speed: round1(current.wind_speed_10m),
+        gust: round1(current.wind_gusts_10m),
+        direction: current.wind_direction_10m,
+        cardinal: current.wind_direction_10m != null ? degToCardinal(current.wind_direction_10m) : null,
+      },
+      humidity: current.relative_humidity_2m,
+      pressure: { value: current.surface_pressure != null ? Math.round(current.surface_pressure) : null, unit: 'hPa' },
+      visibility: { value: current.visibility != null ? round1(current.visibility / 1000) : null, unit: 'km' },
+      uv_index: current.uv_index != null ? round1(current.uv_index) : null,
+      dew_point: round1(current.dew_point_2m),
+      cloud_cover: current.cloud_cover,
+      precipitation: { probability: hourlyOut[0]?.precipitation_probability ?? null, intensity: current.precipitation ?? 0 },
+      air_quality: {
+        aqi: aqiCurrent?.us_aqi ?? null,
+        category: aqiCategory(aqiCurrent?.us_aqi ?? null),
+        pm2_5: aqiCurrent?.pm2_5 ?? null,
+        pm10: aqiCurrent?.pm10 ?? null,
+        o3: aqiCurrent?.ozone ?? null,
+      },
+    },
+    hourly: hourlyOut,
+    daily: dailyOut,
+    alerts,
+    ai_analysis: climateAnalysis
+      ? {
+          summary: climateAnalysis.summary,
+          climate_normals: climateAnalysis.climate_normals,
+          forecast_vs_normal: climateAnalysis.forecast_vs_normal,
+          daily_warnings: climateAnalysis.daily_warnings,
+        }
+      : null,
+    metadata: {
+      provider: 'Open-Meteo (via custom backend)',
+      generated_at: new Date().toISOString(),
+      units,
+      request_id: requestId,
+    },
+  };
 }
 
+/* ============================================================
+   Кэшированная сборка данных (1 минута)
+   ============================================================ */
+function getCachedWeatherBundle(lat, lon, units) {
+  return unstable_cache(
+    async () => {
+      const [weatherData, aqiData, archiveData] = await Promise.all([
+        fetchWeather(lat, lon, units),
+        fetchAirQuality(lat, lon).catch(() => null),
+        fetchClimateHistory(lat, lon).catch(() => null),
+      ]);
+      return { weatherData, aqiData, archiveData };
+    },
+    ['weather-bundle', lat.toFixed(2), lon.toFixed(2), units],
+    { revalidate: CACHE_TTL_SECONDS }
+  )();
+}
+
+const getCachedLocation = (city) =>
+  unstable_cache(async () => geocodeByCity(city), ['geocode-city', city.toLowerCase()], { revalidate: 60 * 60 * 24 })();
+
+const getCachedReverseLocation = (lat, lon) =>
+  unstable_cache(async () => reverseGeocode(lat, lon), ['geocode-reverse', lat.toFixed(2), lon.toFixed(2)], { revalidate: 60 * 60 * 24 })();
+
+/* ============================================================
+   GET /api/weather?city=Moscow  |  ?lat=..&lon=..  |  &units=imperial
+   ============================================================ */
 export async function GET(request) {
+  const requestId = `req_${randomUUID().replace(/-/g, '').slice(0, 20)}`;
   const { searchParams } = new URL(request.url);
-  const lat = searchParams.get('lat') || '55.75';
-  const lon = searchParams.get('lon') || '37.62';
-  const needAI = searchParams.get('ai') === 'true';
-  const windThreshold = parseInt(searchParams.get('wind_threshold')) || 15;
+
+  const units = searchParams.get('units') === 'imperial' ? 'imperial' : 'metric';
+  const city = searchParams.get('city');
+  let lat = parseFloat(searchParams.get('lat'));
+  let lon = parseFloat(searchParams.get('lon'));
+  let locationMeta = null;
 
   try {
-    // ✅ ИДЕАЛ: Добавлены wind_gusts_10m, uv_index, sunrise/sunset
-    const openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,surface_pressure,uv_index` +
-      `&hourly=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation_probability,precipitation,cloudcover,uv_index,surface_pressure` +
-      `&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,wind_direction_10m_dominant,uv_index_max,precipitation_sum,precipitation_probability_max,sunrise,sunset` +
-      `&forecast_days=14` +
-      `&models=best_match,gfs_seamless` + 
-      `&timezone=auto`;
-
-    const response = await fetch(openMeteoUrl, { next: { revalidate: 300 } });
-    if (!response.ok) throw new Error('Open-Meteo API connection failed');
-    const data = await response.json();
-
-    const hourlyTimes = data.hourly?.time || [];
-    const dailyTimes = data.daily?.time || [];
-
-    // Поиск индекса текущего часа
-    const now = new Date();
-    let currentHourIndex = -1;
-    for(let i=0; i<hourlyTimes.length; i++) {
-        const hTime = new Date(hourlyTimes[i]);
-        if (Math.abs(hTime.getTime() - now.getTime()) < 30 * 60 * 1000) {
-            currentHourIndex = i;
-            break;
-        }
+    if ((isNaN(lat) || isNaN(lon)) && city) {
+      locationMeta = await getCachedLocation(city);
+      if (!locationMeta) {
+        return NextResponse.json(
+          { error: 'location_not_found', message: `Could not find location: ${city}`, request_id: requestId },
+          { status: 404 }
+        );
+      }
+      lat = locationMeta.lat;
+      lon = locationMeta.lon;
     }
 
-    const hourlyForecast = hourlyTimes.slice(0, 24).map((time, idx) => {
-      let temp = data.hourly?.temperature_2m_best_match?.[idx] ?? data.hourly?.temperature_2m?.[idx] ?? null;
-      
-      // Синхронизация с current только для текущего часа
-      if (idx === currentHourIndex && data.current) {
-         temp = data.current.temperature_2m_best_match ?? data.current.temperature_2m;
-      }
-
-      return {
-        time, // ✅ ИДЕАЛ: Время уже приходит с таймзоной от Open-Meteo (например, T00:00+03:00)
-        temp,
-        condition: getWeatherCondition(data.hourly?.weather_code_best_match?.[idx] ?? data.hourly?.weather_code?.[idx] ?? 0),
-        // ✅ ИДЕАЛ: Полный объект ветра (speed, direction, deg, gusts)
-        wind: {
-          speed: data.hourly?.wind_speed_10m_best_match?.[idx] ?? data.hourly?.wind_speed_10m?.[idx] ?? null,
-          deg: data.hourly?.wind_direction_10m_best_match?.[idx] ?? data.hourly?.wind_direction_10m?.[idx] ?? null,
-          direction: getWindDirection(data.hourly?.wind_direction_10m_best_match?.[idx] ?? data.hourly?.wind_direction_10m?.[idx]),
-          gusts: data.hourly?.wind_gusts_10m_best_match?.[idx] ?? data.hourly?.wind_gusts_10m?.[idx] ?? null
-        },
-        precipitation_probability: data.hourly?.precipitation_probability_best_match?.[idx] ?? data.hourly?.precipitation_probability?.[idx] ?? null,
-        precipitation_mm: data.hourly?.precipitation_best_match?.[idx] ?? data.hourly?.precipitation?.[idx] ?? null,
-        cloud_cover: data.hourly?.cloudcover_best_match?.[idx] ?? data.hourly?.cloudcover?.[idx] ?? null,
-        uv_index: data.hourly?.uv_index_best_match?.[idx] ?? data.hourly?.uv_index?.[idx] ?? null,
-        pressure: data.hourly?.surface_pressure_best_match?.[idx] ?? data.hourly?.surface_pressure?.[idx] ?? null
-      };
-    });
-
-    const dailyForecast = dailyTimes.map((date, idx) => ({
-      date,
-      temp_max: data.daily?.temperature_2m_max_best_match?.[idx] ?? data.daily?.temperature_2m_max?.[idx] ?? null,
-      temp_min: data.daily?.temperature_2m_min_best_match?.[idx] ?? data.daily?.temperature_2m_min?.[idx] ?? null,
-      condition: getWeatherCondition(data.daily?.weather_code_best_match?.[idx] ?? data.daily?.weather_code?.[idx] ?? 0),
-      wind: {
-        speed: data.daily?.wind_speed_10m_max_best_match?.[idx] ?? data.daily?.wind_speed_10m_max?.[idx] ?? null,
-        direction: getWindDirection(data.daily?.wind_direction_10m_dominant_best_match?.[idx] ?? data.daily?.wind_direction_10m_dominant?.[idx] ?? 0)
-      },
-      uv_index_max: data.daily?.uv_index_max_best_match?.[idx] ?? data.daily?.uv_index_max?.[idx] ?? null,
-      precipitation_sum_mm: data.daily?.precipitation_sum_best_match?.[idx] ?? data.daily?.precipitation_sum?.[idx] ?? null,
-      precipitation_probability_max: data.daily?.precipitation_probability_max_best_match?.[idx] ?? data.daily?.precipitation_probability_max?.[idx] ?? null,
-      // ✅ ИДЕАЛ: Время восхода и заката
-      sunrise: data.daily?.sunrise?.[idx],
-      sunset: data.daily?.sunset?.[idx]
-    }));
-
-    // Структурирование моделей
-    const gfsHourlyStructured = (data.hourly?.temperature_2m_gfs_seamless || []).slice(0, 24).map((t, i) => ({
-      time: hourlyTimes[i],
-      temp: t
-    }));
-
-    const weatherData = {
-      meta: { 
-        lat: data.latitude, 
-        lon: data.longitude, 
-        timezone: data.timezone, 
-        elevation: data.elevation,
-        generated_at: new Date().toISOString()
-      },
-      units: {
-        temp: "°C",
-        wind_speed: "m/s",
-        humidity: "%",
-        pressure: "hPa",
-        precipitation: "mm"
-      },
-      current: {
-        temp: data.current?.temperature_2m_best_match ?? data.current?.temperature_2m,
-        feels_like: data.current?.apparent_temperature_best_match ?? data.current?.apparent_temperature,
-        humidity: data.current?.relative_humidity_2m_best_match ?? data.current?.relative_humidity_2m,
-        pressure: data.current?.surface_pressure_best_match ?? data.current?.surface_pressure,
-        // ✅ ИДЕАЛ: Текущий УФ-индекс (как у Яндекса)
-        uv_index: data.current?.uv_index_best_match ?? data.current?.uv_index,
-        condition: getWeatherCondition(data.current?.weather_code_best_match ?? data.current?.weather_code),
-        wind: {
-          speed: data.current?.wind_speed_10m_best_match ?? data.current?.wind_speed_10m,
-          deg: data.current?.wind_direction_10m_best_match ?? data.current?.wind_direction_10m,
-          direction: getWindDirection(data.current?.wind_direction_10m_best_match ?? data.current?.wind_direction_10m),
-          // ✅ ИДЕАЛ: Порывы ветра в current
-          gusts: data.current?.wind_gusts_10m_best_match ?? data.current?.wind_gusts_10m
-        }
-      },
-      hourly: hourlyForecast,
-      daily: dailyForecast,
-      models: {
-        gfs: {
-          hourly: gfsHourlyStructured 
-        }
-      }
-    };
-
-    // Логика AI анализа
-    let aiAnalysisObj = null;
-    if (needAI) {
-      try {
-        const systemPrompt = "You are an expert AI Meteorologist. Analyze the weather JSON and provide a brief summary, list of alerts, and a practical tip in valid JSON format matching fields: summary, alerts (array), tip.";
-        const res = await fetch(`https://text.pollinations.ai/${encodeURIComponent(systemPrompt + "\n\n" + JSON.stringify(weatherData))}?model=searchshadow&cache=false`, {
-          signal: AbortSignal.timeout(5000)
-        });
-        
-        if (res.ok) {
-          const txt = await res.text();
-          if (txt && !txt.includes('overloaded') && !txt.includes('unavailable')) {
-            try {
-              const cleanedTxt = txt.substring(txt.indexOf('{'), txt.lastIndexOf('}') + 1);
-              aiAnalysisObj = JSON.parse(cleanedTxt);
-            } catch {
-              aiAnalysisObj = { summary: txt, alerts: [], tip: "Review full data for recommendations." };
-            }
-          }
-        }
-      } catch (e) {
-        console.log("External AI fetch omitted or failed:", e.message);
-      }
-
-      if (!aiAnalysisObj) {
-        aiAnalysisObj = generateLocalAnalysis(weatherData, windThreshold);
-      }
+    if (isNaN(lat) || isNaN(lon)) {
+      return NextResponse.json(
+        { error: 'bad_request', message: 'Provide either ?city=Name or ?lat=..&lon=..', request_id: requestId },
+        { status: 400 }
+      );
     }
 
-    return NextResponse.json({
-      weather: weatherData,
-      ...(needAI && { ai_analysis: aiAnalysisObj })
+    const { weatherData, aqiData, archiveData } = await getCachedWeatherBundle(lat, lon, units);
+
+    if (!locationMeta) {
+      locationMeta = await getCachedReverseLocation(lat, lon).catch(() => null);
+    }
+
+    const climateAnalysis = buildClimateAnalysis({
+      dailyForecast: weatherData.daily,
+      archiveDaily: archiveData?.daily,
+      locationName: locationMeta?.name || 'выбранном регионе',
     });
 
-  } catch (error) {
+    const responseBody = buildWeatherResponse({
+      lat, lon, locationMeta, weatherData, aqiData, climateAnalysis, units, requestId,
+    });
+
+    return NextResponse.json(responseBody, {
+      headers: { 'Cache-Control': `public, s-maxage=${CACHE_TTL_SECONDS}, stale-while-revalidate=30` },
+    });
+  } catch (err) {
+    console.error('Weather fetch failed:', err);
     return NextResponse.json(
-      { error: 'Internal Server Error', details: error.message },
-      { status: 500 }
+      { error: 'upstream_error', message: 'Failed to fetch weather data', details: err.message, request_id: requestId },
+      { status: 502 }
     );
   }
-      }
+    }
