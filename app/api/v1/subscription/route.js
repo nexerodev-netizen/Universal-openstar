@@ -6,7 +6,7 @@ import path from 'path';
 import crypto from 'crypto';
 
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
-const SUB_DIR = path.join(process.cwd(), 'subscriptions');
+const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt'); // Возвращаем общий файл, как ты просил
 
 const BROWSER_KEYWORDS = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera', 'msie', 'trident'];
 
@@ -18,7 +18,6 @@ function isBrowser(userAgent) {
     return hasBrowser && !isVpnClient;
 }
 
-// Парсинг длительности: 8m, 1h, 7d, 30m и т.д.
 function parseDuration(durationStr) {
     if (!durationStr) return '10m';
     const match = durationStr.match(/^(\d+)([mhd])$/);
@@ -27,10 +26,9 @@ function parseDuration(durationStr) {
     const value = parseInt(match[1]);
     const unit = match[2];
     
-    // Ограничения для безопасности
-    if (unit === 'm' && value > 1440) return '1440m'; // макс 24 часа в минутах
-    if (unit === 'h' && value > 720) return '720h';   // макс 30 дней в часах
-    if (unit === 'd' && value > 365) return '365d';   // макс 1 год
+    if (unit === 'm' && value > 1440) return '1440m';
+    if (unit === 'h' && value > 720) return '720h';
+    if (unit === 'd' && value > 365) return '365d';
     
     return `${value}${unit}`;
 }
@@ -82,9 +80,8 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId, action = null
     const isExpired = !isValid;
     const statusColor = isExpired ? '#ef4444' : '#10b981';
     let statusText = isExpired ? 'ПОДПИСКА ИСТЕКЛА' : 'АКТИВНА';
-    let statusIcon = isExpired ? '⛔' : '✅';
+    let statusIcon = isExpired ? '' : '✅';
     
-    // Сообщения для действий
     if (action === 'renewed') {
         statusText = 'ПОДПИСКА ПРОДЛЕНА';
         statusColor = '#3b82f6';
@@ -158,7 +155,7 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId, action = null
         
         ${!isExpired && !action ? `<div class="timer" id="timer">--:--:--</div>` : ''}
         
-        <button class="copy-btn" onclick="copyLink()">📋 Скопировать ссылку подписки</button>
+        <button class="copy-btn" onclick="copyLink()"> Скопировать ссылку подписки</button>
         <div class="hint">Вставьте эту ссылку в V2RayNG / Hiddify / Streisand<br>для автоматического обновления серверов</div>
     </div>
     
@@ -213,6 +210,7 @@ export async function GET(request) {
     }
 
     // 2. Продление подписки (?renew&token=...&duration=7d)
+    // ТЕПЕРЬ РАБОТАЕТ ДАЖЕ С ИСТЕКШИМИ ТОКЕНАМИ!
     if (searchParams.has('renew')) {
         const rawToken = searchParams.get('token');
         const duration = searchParams.get('duration') || '7d';
@@ -221,25 +219,32 @@ export async function GET(request) {
             return new NextResponse('Нет токена для продления', { status: 400 });
         }
         
-        const check = await verifyToken(rawToken);
-        if (!check.valid) {
-            return new NextResponse('Невозможно продлить истекшую подписку', { status: 400 });
+        // ИЗВЛЕКАЕМ USERID ПРЯМО ИЗ СТРУКТУРЫ ТОКЕНА (без проверки срока!)
+        let userId;
+        const parts = rawToken.split('.');
+        if (parts.length === 4) {
+            userId = parts[3]; // Берем userID из конца ссылки
+        } else {
+            // Если формат странный, пробуем стандартную проверку
+            const check = await verifyToken(rawToken);
+            if (!check.valid) {
+                return new NextResponse('Неверный формат токена', { status: 400 });
+            }
+            userId = check.userId;
         }
         
-        // Создаем новый токен с новым сроком, но тем же userId
-        const newToken = await generateToken(check.userId, duration);
+        // Создаем НОВЫЙ токен для этого же пользователя с новым сроком
+        const newToken = await generateToken(userId, duration);
         const baseUrl = request.nextUrl.origin + '/api/v1/subscription';
         const newLink = `${baseUrl}?token=${newToken}`;
         
         if (isBrowserRequest) {
-            // Для браузера показываем страницу успеха
             const newCheck = await verifyToken(newToken);
-            return new NextResponse(renderSubscriptionPage(newToken, true, newCheck.exp, check.userId, 'renewed'), {
+            return new NextResponse(renderSubscriptionPage(newToken, true, newCheck.exp, userId, 'renewed'), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' }
             });
         }
         
-        // Для клиента отдаем новую ссылку текстом
         return new NextResponse(newLink, { headers: { 'Content-Type': 'text/plain' } });
     }
 
@@ -254,13 +259,11 @@ export async function GET(request) {
         const check = await verifyToken(rawToken);
         
         if (isBrowserRequest) {
-            // Браузеру показываем страницу об удалении
             return new NextResponse(renderSubscriptionPage(rawToken, false, null, check.valid ? check.userId : '', 'deleted'), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' }
             });
         }
         
-        // Клиенту всегда отдаем заглушку при удалении
         return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
     }
 
@@ -284,14 +287,11 @@ export async function GET(request) {
     }
 
     try {
-        const userFilePath = path.join(SUB_DIR, `${check.userId}.txt`);
-        
-        if (!fs.existsSync(userFilePath)) {
-            const stub = getExpiredStubLink().replace('ПОДПИСКА ЗАКОНЧИЛАСЬ', 'НЕТ ДОСТУПА');
-            return new NextResponse(stub, { headers: { 'Content-Type': 'text/plain' } });
+        // Читаем общий файл для всех
+        if (!fs.existsSync(SUB_FILE_PATH)) {
+            return new NextResponse('Файл sub-test.txt не найден', { status: 404 });
         }
-        
-        const content = fs.readFileSync(userFilePath, 'utf-8').trim();
+        const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8').trim();
         
         if (isBrowserRequest) {
             return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp, check.userId), {
@@ -304,4 +304,4 @@ export async function GET(request) {
         console.error('Ошибка:', err);
         return new NextResponse('Ошибка сервера', { status: 500 });
     }
-        }
+                }
