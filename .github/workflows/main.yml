@@ -1,0 +1,105 @@
+name: Обновить подписку на VPN
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *' # Автоматический запуск каждые 6 часов
+  workflow_dispatch: # Кнопка для ручного запуска
+
+permissions:
+  contents: write
+
+jobs:
+  update-file:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download, Decode and Process Both Sources
+        run: |
+          # 1. Создаем чистые временные файлы
+          touch temp_gen.txt
+          touch temp_bypass.txt
+          touch temp_all_sources.txt
+
+          # --- ИСТОЧНИК 1: Скачиваем и декодируем gen.txt ---
+          curl -sSL "https://subrostunnel.vercel.app/gen.txt" -o encoded_source1.txt
+          base64 -d encoded_source1.txt > temp_gen.txt 2>/dev/null || cat encoded_source1.txt > temp_gen.txt
+
+          # --- ИСТОЧНИК 2: Скачиваем твой bypass-1.txt по Raw-ссылке ---
+          curl -sSL "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-1.txt" -o temp_bypass.txt
+          # Добавляем пустую строку в конец скачанного файла на всякий случай для awk
+          echo "" >> temp_bypass.txt
+
+          # --- ТЕПЕРЬ ЖЕЛЕЗНО СОЕДИНЯЕМ ИХ В ОДИН ФАЙЛ НА СТАРТЕ ---
+          cat temp_gen.txt > temp_all_sources.txt
+          cat temp_bypass.txt >> temp_all_sources.txt
+
+          # --- ОЧИСТКА ОТ МУСОРА И ХУСТЕРИИ ---
+          # Полностью удаляем Hysteria/Hysteria2 в любом регистре
+          sed -i '/[Hh][Yy][Ss][Tt][Ee][Rr][Ii][Aa]/d' temp_all_sources.txt
+          
+          # Удаляем первую нерабочую рекламную заглушку РосТуннеля (VLESS/TCP)
+          sed -i '/РосТуннель/d' temp_all_sources.txt
+
+          # Удаляем мусорные служебные строки заголовков из обоих источников
+          sed -i '/#profile-title/d' temp_all_sources.txt
+          sed -i '/#profile-update-interval/d' temp_all_sources.txt
+          sed -i '/#support-url/d' temp_all_sources.txt
+          sed -i '/#announce/d' temp_all_sources.txt
+          sed -i '/#subscription-userinfo/d' temp_all_sources.txt
+
+          # --- УМНОЕ ПЕРЕИМЕНОВАНИЕ ПОСЛЕ СЛИЯНИЯ ---
+          awk '
+          NF {
+              # Отделяем ссылку от старого названия (по первому знаку #)
+              split($0, parts, "#");
+              link = parts[1];
+              old_name = parts[2];
+
+              # Переводим всю строку в нижний регистр для точной проверки LTE
+              lower_line = tolower($0);
+              
+              if (lower_line ~ /lte/) {
+                  lte_count++;
+                  flags = "";
+                  # Вытягиваем коды флагов (%F0...) из оригинального имени
+                  if (match(old_name, /%[A-Fa-f0-9%]+/)) {
+                      flags = " " substr(old_name, RSTART, RLENGTH);
+                  }
+                  print link "#[OpenStar] LTE " lte_count flags;
+              } else {
+                  srv_count++;
+                  print link "#[OpenStar] Test Server " srv_count;
+              }
+          }
+          ' temp_all_sources.txt > final_clean_servers.txt
+
+          # --- СБОРКА ИТОГОВОГО ФАЙЛА С ANNOUNCE ---
+          echo "# profile-title: 🌟 Open Star VPN" > sub-test.txt
+          echo "#subscription-userinfo: upload=0; download=0; total=0" >> sub-test.txt
+          echo "# profile-update-interval: 1" >> sub-test.txt
+          echo "#announce: ⚡ Подписка OpenStar активирована! Успешный обход глушилок ⚡" >> sub-test.txt
+          
+          # Закидываем готовые сервера в итоговый файл
+          cat final_clean_servers.txt >> sub-test.txt
+
+          # Чистим временный мусор
+          rm -f encoded_source1.txt temp_gen.txt temp_bypass.txt temp_all_sources.txt final_clean_servers.txt
+
+      - name: Commit and Push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          if git status --porcelain | grep -q "sub-test.txt"; then
+            git add sub-test.txt
+            git commit -m "Auto-update: downloading remote bypass-1, fixed filters and naming"
+            git push
+          else
+            echo "No changes detected in sub-test.txt"
+          fi
