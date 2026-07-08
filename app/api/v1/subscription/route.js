@@ -5,8 +5,6 @@ import fs from 'fs';
 import path from 'path';
 
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
-
-// Используем process.cwd() для точного определения корня проекта на сервере
 const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt');
 
 async function generateToken(userId) {
@@ -26,10 +24,20 @@ async function verifyToken(token) {
     }
 }
 
+function getExpiredStubLink() {
+    const uuid = '00000000-0000-0000-0000-000000000000';
+    const address = 'expired.subscription'; 
+    const port = '443';
+    const remark = encodeURIComponent('⛔ ПОДПИСКА ЗАКОНЧИЛАСЬ - ОБНОВИТЕ ДОСТУП ⛔');
+    
+    // Добавляем emoji и капс, чтобы точно бросалось в глаза
+    return `vless://${uuid}@${address}:${port}?security=none&type=tcp#${remark}`;
+}
+
 export async function GET(request) {
     const { searchParams } = new URL(request.url);
     
-    // 1. Генерация: /api/subscription?generate&userId=user1
+    // 1. Генерация токена
     if (searchParams.has('generate')) {
         const userId = searchParams.get('userId');
         if (!userId) return new NextResponse('Нужен userId', { status: 400 });
@@ -38,25 +46,38 @@ export async function GET(request) {
         return new NextResponse(token, { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    // 2. Проверка и выдача файла: /api/subscription?token=eyJ...
+    // 2. Проверка токена
     const token = searchParams.get('token');
     if (!token) return new NextResponse('Нет токена', { status: 400 });
 
     const check = await verifyToken(token);
-    if (!check.valid) return new NextResponse('Токен истек или неверен', { status: 401 });
-
-    // Читаем файл безопасно для Vercel
+    
+    // Читаем файл СНАЧАЛА (нужен в обоих случаях)
+    let fileContent = '';
     try {
-        // Проверяем существование перед чтением
-        if (!fs.existsSync(SUB_FILE_PATH)) {
-            console.error('Файл не найден по пути:', SUB_FILE_PATH);
-            return new NextResponse('Файл sub-test.txt не найден на сервере', { status: 404 });
+        if (fs.existsSync(SUB_FILE_PATH)) {
+            fileContent = fs.readFileSync(SUB_FILE_PATH, 'utf-8').trim();
         }
-        
-        const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8');
-        return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
     } catch (err) {
         console.error('Ошибка чтения файла:', err);
-        return new NextResponse('Ошибка доступа к файлу', { status: 500 });
     }
+
+    // ЕСЛИ ТОКЕН ИСТЕК -> ОТДАЕМ ЗАГЛУШКУ + СТАРЫЕ СЕРВЕРЫ
+    if (!check.valid) {
+        const stubLink = getExpiredStubLink();
+        
+        // Если есть старые серверы, добавляем их после заглушки через перенос строки
+        const response = fileContent 
+            ? `${stubLink}\n${fileContent}` 
+            : stubLink;
+            
+        return new NextResponse(response, { headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    // 3. Если токен активен -> отдаем только реальные серверы
+    if (!fileContent) {
+        return new NextResponse('Файл sub-test.txt не найден', { status: 404 });
+    }
+    
+    return new NextResponse(fileContent, { headers: { 'Content-Type': 'text/plain' } });
 }
