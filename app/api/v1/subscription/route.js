@@ -51,15 +51,17 @@ function getExpiredStubLink() {
     return `vless://${uuid}@${address}:${port}?security=none&type=tcp#${remark}`;
 }
 
-// Генерация HTML страницы подписки
-function renderSubscriptionPage(token, isValid, expiresAt) {
+function renderSubscriptionPage(token, isValid, expiresAt, userId) {
     const isExpired = !isValid;
     const statusColor = isExpired ? '#ef4444' : '#10b981';
     const statusText = isExpired ? 'ПОДПИСКА ИСТЕКЛА' : 'АКТИВНА';
     const statusIcon = isExpired ? '⛔' : '✅';
     
-    // Форматируем время истечения
     const expireDate = expiresAt ? new Date(expiresAt * 1000).toLocaleString('ru-RU') : '-';
+    const displayUserId = userId || (isValid ? token.split('.').pop() : '-');
+    
+    // Считаем оставшееся время для таймера
+    const remainingSeconds = expiresAt ? Math.max(0, Math.floor((expiresAt * 1000 - Date.now()) / 1000)) : 0;
     
     return `<!DOCTYPE html>
 <html lang="ru">
@@ -73,61 +75,86 @@ function renderSubscriptionPage(token, isValid, expiresAt) {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
             color: white; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            padding: 20px;
         }
         .card { 
             background: rgba(255,255,255,0.05); backdrop-filter: blur(10px);
             border: 1px solid rgba(255,255,255,0.1); border-radius: 20px;
-            padding: 40px; max-width: 420px; width: 90%; text-align: center;
+            padding: 40px 30px; max-width: 420px; width: 100%; text-align: center;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
         }
         .status { 
-            font-size: 28px; font-weight: bold; margin-bottom: 10px;
+            font-size: 26px; font-weight: bold; margin-bottom: 15px;
             color: ${statusColor}; display: flex; align-items: center; justify-content: center; gap: 10px;
         }
-        .info { color: #94a3b8; margin-bottom: 20px; line-height: 1.6; }
+        .info-row { 
+            background: rgba(255,255,255,0.05); border-radius: 12px; 
+            padding: 12px; margin-bottom: 10px; text-align: left;
+        }
+        .info-label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+        .info-value { font-size: 16px; font-weight: 500; word-break: break-all; }
         .timer { 
-            font-size: 36px; font-weight: bold; margin: 20px 0;
-            font-variant-numeric: tabular-nums;
+            font-size: 42px; font-weight: bold; margin: 25px 0;
+            font-variant-numeric: tabular-nums; letter-spacing: 2px;
         }
         .copy-btn {
             background: ${statusColor}; color: white; border: none;
-            padding: 14px 28px; border-radius: 12px; font-size: 16px;
-            cursor: pointer; transition: opacity 0.2s; width: 100%; margin-top: 10px;
+            padding: 16px 28px; border-radius: 12px; font-size: 16px; font-weight: 600;
+            cursor: pointer; transition: all 0.2s; width: 100%; margin-top: 10px;
         }
-        .copy-btn:hover { opacity: 0.9; }
+        .copy-btn:hover { opacity: 0.9; transform: translateY(-1px); }
         .copy-btn:active { transform: scale(0.98); }
-        .hint { font-size: 12px; color: #64748b; margin-top: 15px; }
+        .hint { font-size: 12px; color: #64748b; margin-top: 15px; line-height: 1.5; }
     </style>
 </head>
 <body>
     <div class="card">
         <div class="status">${statusIcon} ${statusText}</div>
-        <div class="info">
-            User ID: ${isExpired ? '-' : token.split('.').pop()}<br>
-            Истекает: ${expireDate}
+        
+        <div class="info-row">
+            <div class="info-label">User ID</div>
+            <div class="info-value">${displayUserId}</div>
         </div>
+        
+        <div class="info-row">
+            <div class="info-label">Истекает</div>
+            <div class="info-value">${expireDate}</div>
+        </div>
+        
         ${!isExpired ? `<div class="timer" id="timer">--:--:--</div>` : ''}
+        
         <button class="copy-btn" onclick="copyLink()">📋 Скопировать ссылку подписки</button>
-        <div class="hint">Вставьте эту ссылку в V2RayNG / Hiddify / Streisand</div>
+        <div class="hint">Вставьте эту ссылку в V2RayNG / Hiddify / Streisand<br>для автоматического обновления серверов</div>
     </div>
+    
     <script>
-        const link = '${token}';
+        const currentUrl = window.location.href;
+        
         function copyLink() {
-            navigator.clipboard.writeText(window.location.href).then(() => {
+            navigator.clipboard.writeText(currentUrl).then(() => {
                 const btn = document.querySelector('.copy-btn');
+                const original = btn.textContent;
                 btn.textContent = '✅ Скопировано!';
-                setTimeout(() => btn.textContent = '📋 Скопировать ссылку подписки', 2000);
+                btn.style.background = '#10b981';
+                setTimeout(() => {
+                    btn.textContent = original;
+                    btn.style.background = '${statusColor}';
+                }, 2000);
             });
         }
+        
         ${!isExpired ? `
+        const expiresAt = ${expiresAt};
         function updateTimer() {
-            const diff = Math.max(0, Math.floor((${expiresAt} * 1000 - Date.now()) / 1000));
+            const diff = Math.max(0, Math.floor((expiresAt * 1000 - Date.now()) / 1000));
             const h = String(Math.floor(diff / 3600)).padStart(2, '0');
             const m = String(Math.floor((diff % 3600) / 60)).padStart(2, '0');
             const s = String(diff % 60).padStart(2, '0');
             document.getElementById('timer').textContent = h + ':' + m + ':' + s;
             if (diff <= 0) location.reload();
         }
-        updateTimer(); setInterval(updateTimer, 1000);
+        updateTimer();
+        setInterval(updateTimer, 1000);
         ` : ''}
     </script>
 </body>
@@ -137,44 +164,42 @@ function renderSubscriptionPage(token, isValid, expiresAt) {
 export async function GET(request) {
     const { searchParams } = new URL(request.url);
     const userAgent = request.headers.get('user-agent') || '';
-    const isBrowser = !userAgent.toLowerCase().includes('v2ray') && 
-                      !userAgent.toLowerCase().includes('clash') &&
-                      !userAgent.toLowerCase().includes('hiddify') &&
-                      !userAgent.toLowerCase().includes('streisand');
+    
+    // Определяем, является ли запрос от VPN-клиента
+    const isVpnClient = /v2ray|clash|hiddify|streisand|shadowrocket|surge/i.test(userAgent);
 
-    // 1. Генерация новой подписки
-    if (searchParams.has('generate') || !searchParams.has('token')) {
+    // 1. Генерация новой подписки (?generate)
+    if (searchParams.has('generate')) {
         const duration = searchParams.get('duration') || '10m';
         const userId = generateUserId();
         const fullToken = await generateToken(userId, duration);
         const baseUrl = request.nextUrl.origin + '/api/v1/subscription';
         const subscriptionLink = `${baseUrl}?token=${fullToken}`;
         
-        // Для браузера — показываем страницу, для клиента — чистую ссылку
-        if (isBrowser) {
-            return new NextResponse(renderSubscriptionPage(fullToken, true, null), {
-                headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            });
-        }
+        // Всегда отдаем чистый текст при генерации
         return new NextResponse(subscriptionLink, { headers: { 'Content-Type': 'text/plain' } });
     }
 
     // 2. Проверка токена
     const rawToken = searchParams.get('token');
-    if (!rawToken) return new NextResponse('Нет токена', { status: 400 });
+    if (!rawToken) {
+        // Если нет токена и не generate — показываем страницу генерации
+        return new NextResponse(renderSubscriptionPage('', false, null, ''), {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        });
+    }
 
     const check = await verifyToken(rawToken);
 
-    // Если токен истек
+    // Если токен истек или невалиден
     if (!check.valid) {
-        // Браузеру — красивая страница об истечении
-        if (isBrowser) {
-            return new NextResponse(renderSubscriptionPage(rawToken, false, null), {
-                headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            });
+        // VPN-клиенту отдаем заглушку, браузеру — страницу
+        if (isVpnClient) {
+            return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
         }
-        // Клиенту — заглушка VLESS
-        return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
+        return new NextResponse(renderSubscriptionPage(rawToken, false, null, ''), {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        });
     }
 
     // Токен активен
@@ -184,15 +209,15 @@ export async function GET(request) {
         }
         const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8').trim();
         
-        // Браузеру — страница статуса, клиенту — серверы
-        if (isBrowser) {
-            return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp), {
-                headers: { 'Content-Type': 'text/html; charset=utf-8' }
-            });
+        // VPN-клиенту отдаем серверы, браузеру — страницу статуса
+        if (isVpnClient) {
+            return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
         }
-        return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
+        return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp, check.userId), {
+            headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        });
     } catch (err) {
         console.error('Ошибка чтения файла:', err);
         return new NextResponse('Ошибка доступа к файлу', { status: 500 });
     }
-            }
+          }
