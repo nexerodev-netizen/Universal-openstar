@@ -6,7 +6,7 @@ import path from 'path';
 import crypto from 'crypto';
 
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
-const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt'); // Возвращаем общий файл, как ты просил
+const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt');
 
 const BROWSER_KEYWORDS = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera', 'msie', 'trident'];
 
@@ -18,6 +18,7 @@ function isBrowser(userAgent) {
     return hasBrowser && !isVpnClient;
 }
 
+// Парсинг длительности: макс 365 дней
 function parseDuration(durationStr) {
     if (!durationStr) return '10m';
     const match = durationStr.match(/^(\d+)([mhd])$/);
@@ -26,9 +27,10 @@ function parseDuration(durationStr) {
     const value = parseInt(match[1]);
     const unit = match[2];
     
-    if (unit === 'm' && value > 1440) return '1440m';
-    if (unit === 'h' && value > 720) return '720h';
+    // Ограничения: макс 365 дней, 8760 часов или 525600 минут
     if (unit === 'd' && value > 365) return '365d';
+    if (unit === 'h' && value > 8760) return '8760h';
+    if (unit === 'm' && value > 525600) return '525600m';
     
     return `${value}${unit}`;
 }
@@ -78,7 +80,9 @@ function getExpiredStubLink() {
 
 function renderSubscriptionPage(token, isValid, expiresAt, userId, action = null) {
     const isExpired = !isValid;
-    const statusColor = isExpired ? '#ef4444' : '#10b981';
+    
+    // ИСПРАВЛЕНИЕ: используем let вместо const, чтобы можно было менять значения ниже
+    let statusColor = isExpired ? '#ef4444' : '#10b981';
     let statusText = isExpired ? 'ПОДПИСКА ИСТЕКЛА' : 'АКТИВНА';
     let statusIcon = isExpired ? '' : '✅';
     
@@ -210,7 +214,7 @@ export async function GET(request) {
     }
 
     // 2. Продление подписки (?renew&token=...&duration=7d)
-    // ТЕПЕРЬ РАБОТАЕТ ДАЖЕ С ИСТЕКШИМИ ТОКЕНАМИ!
+    // РАБОТАЕТ ДАЖЕ С ИСТЕКШИМИ ТОКЕНАМИ!
     if (searchParams.has('renew')) {
         const rawToken = searchParams.get('token');
         const duration = searchParams.get('duration') || '7d';
@@ -304,4 +308,4 @@ export async function GET(request) {
         console.error('Ошибка:', err);
         return new NextResponse('Ошибка сервера', { status: 500 });
     }
-                }
+                                                           }
