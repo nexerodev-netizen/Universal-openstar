@@ -8,6 +8,18 @@ import crypto from 'crypto';
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
 const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt');
 
+// Список ключевых слов браузеров
+const BROWSER_KEYWORDS = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera', 'msie', 'trident'];
+
+function isBrowser(userAgent) {
+    if (!userAgent) return false;
+    const ua = userAgent.toLowerCase();
+    // Проверяем, есть ли в UA хотя бы одно слово браузера И НЕТ слов VPN-клиентов
+    const hasBrowser = BROWSER_KEYWORDS.some(kw => ua.includes(kw));
+    const isVpnClient = /v2ray|clash|hiddify|streisand|shadowrocket|surge|okhttp|java/i.test(ua);
+    return hasBrowser && !isVpnClient;
+}
+
 function generateUserId() {
     return 'user_' + crypto.randomBytes(6).toString('hex');
 }
@@ -59,10 +71,7 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId) {
     
     const expireDate = expiresAt ? new Date(expiresAt * 1000).toLocaleString('ru-RU') : '-';
     const displayUserId = userId || (isValid ? token.split('.').pop() : '-');
-    
-    // Считаем оставшееся время для таймера
-    const remainingSeconds = expiresAt ? Math.max(0, Math.floor((expiresAt * 1000 - Date.now()) / 1000)) : 0;
-    
+
     return `<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -164,9 +173,7 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId) {
 export async function GET(request) {
     const { searchParams } = new URL(request.url);
     const userAgent = request.headers.get('user-agent') || '';
-    
-    // Определяем, является ли запрос от VPN-клиента
-    const isVpnClient = /v2ray|clash|hiddify|streisand|shadowrocket|surge/i.test(userAgent);
+    const isBrowserRequest = isBrowser(userAgent);
 
     // 1. Генерация новой подписки (?generate)
     if (searchParams.has('generate')) {
@@ -176,14 +183,14 @@ export async function GET(request) {
         const baseUrl = request.nextUrl.origin + '/api/v1/subscription';
         const subscriptionLink = `${baseUrl}?token=${fullToken}`;
         
-        // Всегда отдаем чистый текст при генерации
+        // При генерации всегда отдаем чистый текст (ссылку)
         return new NextResponse(subscriptionLink, { headers: { 'Content-Type': 'text/plain' } });
     }
 
     // 2. Проверка токена
     const rawToken = searchParams.get('token');
     if (!rawToken) {
-        // Если нет токена и не generate — показываем страницу генерации
+        // Если нет токена — показываем HTML страницу с инструкцией
         return new NextResponse(renderSubscriptionPage('', false, null, ''), {
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
         });
@@ -193,13 +200,14 @@ export async function GET(request) {
 
     // Если токен истек или невалиден
     if (!check.valid) {
-        // VPN-клиенту отдаем заглушку, браузеру — страницу
-        if (isVpnClient) {
-            return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
+        // Браузеру — красивая страница ошибки
+        if (isBrowserRequest) {
+            return new NextResponse(renderSubscriptionPage(rawToken, false, null, ''), {
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
         }
-        return new NextResponse(renderSubscriptionPage(rawToken, false, null, ''), {
-            headers: { 'Content-Type': 'text/html; charset=utf-8' }
-        });
+        // VPN-клиенту — заглушка текстом
+        return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
     }
 
     // Токен активен
@@ -209,15 +217,17 @@ export async function GET(request) {
         }
         const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8').trim();
         
-        // VPN-клиенту отдаем серверы, браузеру — страницу статуса
-        if (isVpnClient) {
-            return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
+        // Браузеру — красивая страница статуса
+        if (isBrowserRequest) {
+            return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp, check.userId), {
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
         }
-        return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp, check.userId), {
-            headers: { 'Content-Type': 'text/html; charset=utf-8' }
-        });
+        
+        // VPN-клиенту — чистый список серверов
+        return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
     } catch (err) {
         console.error('Ошибка чтения файла:', err);
         return new NextResponse('Ошибка доступа к файлу', { status: 500 });
     }
-          }
+}
