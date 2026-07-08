@@ -5,6 +5,8 @@ import fs from 'fs';
 import path from 'path';
 
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
+
+// Используем process.cwd() для точного определения корня проекта на сервере
 const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt');
 
 async function generateToken(userId) {
@@ -43,11 +45,18 @@ export async function GET(request) {
     const check = await verifyToken(token);
     if (!check.valid) return new NextResponse('Токен истек или неверен', { status: 401 });
 
-    // Читаем файл и отдаем его содержимое
+    // Читаем файл безопасно для Vercel
     try {
+        // Проверяем существование перед чтением
+        if (!fs.existsSync(SUB_FILE_PATH)) {
+            console.error('Файл не найден по пути:', SUB_FILE_PATH);
+            return new NextResponse('Файл sub-test.txt не найден на сервере', { status: 404 });
+        }
+        
         const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8');
         return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
     } catch (err) {
-        return new NextResponse('Файл sub-test.txt не найден', { status: 404 });
+        console.error('Ошибка чтения файла:', err);
+        return new NextResponse('Ошибка доступа к файлу', { status: 500 });
     }
 }
