@@ -6,18 +6,33 @@ import path from 'path';
 import crypto from 'crypto';
 
 const SECRET = new TextEncoder().encode(process.env.JWT_SECRET || 'super-secret-key-123');
-const SUB_FILE_PATH = path.join(process.cwd(), 'sub-test.txt');
+const SUB_DIR = path.join(process.cwd(), 'subscriptions');
 
-// Список ключевых слов браузеров
 const BROWSER_KEYWORDS = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera', 'msie', 'trident'];
 
 function isBrowser(userAgent) {
     if (!userAgent) return false;
     const ua = userAgent.toLowerCase();
-    // Проверяем, есть ли в UA хотя бы одно слово браузера И НЕТ слов VPN-клиентов
     const hasBrowser = BROWSER_KEYWORDS.some(kw => ua.includes(kw));
     const isVpnClient = /v2ray|clash|hiddify|streisand|shadowrocket|surge|okhttp|java/i.test(ua);
     return hasBrowser && !isVpnClient;
+}
+
+// Парсинг длительности: 8m, 1h, 7d, 30m и т.д.
+function parseDuration(durationStr) {
+    if (!durationStr) return '10m';
+    const match = durationStr.match(/^(\d+)([mhd])$/);
+    if (!match) return '10m';
+    
+    const value = parseInt(match[1]);
+    const unit = match[2];
+    
+    // Ограничения для безопасности
+    if (unit === 'm' && value > 1440) return '1440m'; // макс 24 часа в минутах
+    if (unit === 'h' && value > 720) return '720h';   // макс 30 дней в часах
+    if (unit === 'd' && value > 365) return '365d';   // макс 1 год
+    
+    return `${value}${unit}`;
 }
 
 function generateUserId() {
@@ -25,7 +40,7 @@ function generateUserId() {
 }
 
 async function generateToken(userId, duration = '10m') {
-    const safeDuration = duration && duration.length < 10 ? duration : '10m';
+    const safeDuration = parseDuration(duration);
     const token = await new SignJWT({ userId })
         .setProtectedHeader({ alg: 'HS256' })
         .setIssuedAt()
@@ -63,11 +78,22 @@ function getExpiredStubLink() {
     return `vless://${uuid}@${address}:${port}?security=none&type=tcp#${remark}`;
 }
 
-function renderSubscriptionPage(token, isValid, expiresAt, userId) {
+function renderSubscriptionPage(token, isValid, expiresAt, userId, action = null) {
     const isExpired = !isValid;
     const statusColor = isExpired ? '#ef4444' : '#10b981';
-    const statusText = isExpired ? 'ПОДПИСКА ИСТЕКЛА' : 'АКТИВНА';
-    const statusIcon = isExpired ? '⛔' : '✅';
+    let statusText = isExpired ? 'ПОДПИСКА ИСТЕКЛА' : 'АКТИВНА';
+    let statusIcon = isExpired ? '⛔' : '✅';
+    
+    // Сообщения для действий
+    if (action === 'renewed') {
+        statusText = 'ПОДПИСКА ПРОДЛЕНА';
+        statusColor = '#3b82f6';
+        statusIcon = '🔄';
+    } else if (action === 'deleted') {
+        statusText = 'ДОСТУП УДАЛЁН';
+        statusColor = '#ef4444';
+        statusIcon = '🗑️';
+    }
     
     const expireDate = expiresAt ? new Date(expiresAt * 1000).toLocaleString('ru-RU') : '-';
     const displayUserId = userId || (isValid ? token.split('.').pop() : '-');
@@ -130,7 +156,7 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId) {
             <div class="info-value">${expireDate}</div>
         </div>
         
-        ${!isExpired ? `<div class="timer" id="timer">--:--:--</div>` : ''}
+        ${!isExpired && !action ? `<div class="timer" id="timer">--:--:--</div>` : ''}
         
         <button class="copy-btn" onclick="copyLink()">📋 Скопировать ссылку подписки</button>
         <div class="hint">Вставьте эту ссылку в V2RayNG / Hiddify / Streisand<br>для автоматического обновления серверов</div>
@@ -152,7 +178,7 @@ function renderSubscriptionPage(token, isValid, expiresAt, userId) {
             });
         }
         
-        ${!isExpired ? `
+        ${!isExpired && !action ? `
         const expiresAt = ${expiresAt};
         function updateTimer() {
             const diff = Math.max(0, Math.floor((expiresAt * 1000 - Date.now()) / 1000));
@@ -175,7 +201,7 @@ export async function GET(request) {
     const userAgent = request.headers.get('user-agent') || '';
     const isBrowserRequest = isBrowser(userAgent);
 
-    // 1. Генерация новой подписки (?generate)
+    // 1. Генерация новой подписки (?generate&duration=8m)
     if (searchParams.has('generate')) {
         const duration = searchParams.get('duration') || '10m';
         const userId = generateUserId();
@@ -183,14 +209,64 @@ export async function GET(request) {
         const baseUrl = request.nextUrl.origin + '/api/v1/subscription';
         const subscriptionLink = `${baseUrl}?token=${fullToken}`;
         
-        // При генерации всегда отдаем чистый текст (ссылку)
         return new NextResponse(subscriptionLink, { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    // 2. Проверка токена
+    // 2. Продление подписки (?renew&token=...&duration=7d)
+    if (searchParams.has('renew')) {
+        const rawToken = searchParams.get('token');
+        const duration = searchParams.get('duration') || '7d';
+        
+        if (!rawToken) {
+            return new NextResponse('Нет токена для продления', { status: 400 });
+        }
+        
+        const check = await verifyToken(rawToken);
+        if (!check.valid) {
+            return new NextResponse('Невозможно продлить истекшую подписку', { status: 400 });
+        }
+        
+        // Создаем новый токен с новым сроком, но тем же userId
+        const newToken = await generateToken(check.userId, duration);
+        const baseUrl = request.nextUrl.origin + '/api/v1/subscription';
+        const newLink = `${baseUrl}?token=${newToken}`;
+        
+        if (isBrowserRequest) {
+            // Для браузера показываем страницу успеха
+            const newCheck = await verifyToken(newToken);
+            return new NextResponse(renderSubscriptionPage(newToken, true, newCheck.exp, check.userId, 'renewed'), {
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
+        }
+        
+        // Для клиента отдаем новую ссылку текстом
+        return new NextResponse(newLink, { headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    // 3. Удаление подписки (?delete&token=...)
+    if (searchParams.has('delete')) {
+        const rawToken = searchParams.get('token');
+        
+        if (!rawToken) {
+            return new NextResponse('Нет токена для удаления', { status: 400 });
+        }
+        
+        const check = await verifyToken(rawToken);
+        
+        if (isBrowserRequest) {
+            // Браузеру показываем страницу об удалении
+            return new NextResponse(renderSubscriptionPage(rawToken, false, null, check.valid ? check.userId : '', 'deleted'), {
+                headers: { 'Content-Type': 'text/html; charset=utf-8' }
+            });
+        }
+        
+        // Клиенту всегда отдаем заглушку при удалении
+        return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
+    }
+
+    // 4. Обычная проверка токена
     const rawToken = searchParams.get('token');
     if (!rawToken) {
-        // Если нет токена — показываем HTML страницу с инструкцией
         return new NextResponse(renderSubscriptionPage('', false, null, ''), {
             headers: { 'Content-Type': 'text/html; charset=utf-8' }
         });
@@ -198,36 +274,34 @@ export async function GET(request) {
 
     const check = await verifyToken(rawToken);
 
-    // Если токен истек или невалиден
     if (!check.valid) {
-        // Браузеру — красивая страница ошибки
         if (isBrowserRequest) {
             return new NextResponse(renderSubscriptionPage(rawToken, false, null, ''), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' }
             });
         }
-        // VPN-клиенту — заглушка текстом
         return new NextResponse(getExpiredStubLink(), { headers: { 'Content-Type': 'text/plain' } });
     }
 
-    // Токен активен
     try {
-        if (!fs.existsSync(SUB_FILE_PATH)) {
-            return new NextResponse('Файл sub-test.txt не найден', { status: 404 });
-        }
-        const content = fs.readFileSync(SUB_FILE_PATH, 'utf-8').trim();
+        const userFilePath = path.join(SUB_DIR, `${check.userId}.txt`);
         
-        // Браузеру — красивая страница статуса
+        if (!fs.existsSync(userFilePath)) {
+            const stub = getExpiredStubLink().replace('ПОДПИСКА ЗАКОНЧИЛАСЬ', 'НЕТ ДОСТУПА');
+            return new NextResponse(stub, { headers: { 'Content-Type': 'text/plain' } });
+        }
+        
+        const content = fs.readFileSync(userFilePath, 'utf-8').trim();
+        
         if (isBrowserRequest) {
             return new NextResponse(renderSubscriptionPage(rawToken, true, check.exp, check.userId), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' }
             });
         }
         
-        // VPN-клиенту — чистый список серверов
         return new NextResponse(content, { headers: { 'Content-Type': 'text/plain' } });
     } catch (err) {
-        console.error('Ошибка чтения файла:', err);
-        return new NextResponse('Ошибка доступа к файлу', { status: 500 });
+        console.error('Ошибка:', err);
+        return new NextResponse('Ошибка сервера', { status: 500 });
     }
-}
+        }
