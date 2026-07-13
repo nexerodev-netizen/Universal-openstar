@@ -1,105 +1,108 @@
-name: Обновить подписку на VPN
+name: VPN Parser & Xray Test
 
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: '0 */6 * * *' # Автоматический запуск каждые 6 часов
-  workflow_dispatch: # Кнопка для ручного запуска
+    - cron: '0 */6 * * *' # Каждые 6 часов
+  workflow_dispatch:      # Кнопка ручного запуска
 
 permissions:
   contents: write
 
 jobs:
-  update-file:
+  parse-and-test:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download, Decode and Process Both Sources
+        
+      - name: Setup Python & Xray
         run: |
-          # 1. Создаем чистые временные файлы
-          touch temp_gen.txt
-          touch temp_bypass.txt
-          touch temp_all_sources.txt
-
-          # --- ИСТОЧНИК 1: Скачиваем и декодируем gen.txt ---
-          curl -sSL "https://subrostunnel.vercel.app/gen.txt" -o encoded_source1.txt
-          base64 -d encoded_source1.txt > temp_gen.txt 2>/dev/null || cat encoded_source1.txt > temp_gen.txt
-
-          # --- ИСТОЧНИК 2: Скачиваем твой bypass-1.txt по Raw-ссылке ---
-          curl -sSL "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-1.txt" -o temp_bypass.txt
-          # Добавляем пустую строку в конец скачанного файла на всякий случай для awk
-          echo "" >> temp_bypass.txt
-
-          # --- ТЕПЕРЬ ЖЕЛЕЗНО СОЕДИНЯЕМ ИХ В ОДИН ФАЙЛ НА СТАРТЕ ---
-          cat temp_gen.txt > temp_all_sources.txt
-          cat temp_bypass.txt >> temp_all_sources.txt
-
-          # --- ОЧИСТКА ОТ МУСОРА И ХУСТЕРИИ ---
-          # Полностью удаляем Hysteria/Hysteria2 в любом регистре
-          sed -i '/[Hh][Yy][Ss][Tt][Ee][Rr][Ii][Aa]/d' temp_all_sources.txt
+          pip install requests aiohttp
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o -q Xray-linux-64.zip
+          chmod +x xray
+          sudo mv xray /usr/local/bin/
           
-          # Удаляем первую нерабочую рекламную заглушку РосТуннеля (VLESS/TCP)
-          sed -i '/РосТуннель/d' temp_all_sources.txt
+      - name: Run Parser & Tester
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import requests
+          import subprocess
+          import json
+          import re
+          import os
+          from datetime import datetime
 
-          # Удаляем мусорные служебные строки заголовков из обоих источников
-          sed -i '/#profile-title/d' temp_all_sources.txt
-          sed -i '/#profile-update-interval/d' temp_all_sources.txt
-          sed -i '/#support-url/d' temp_all_sources.txt
-          sed -i '/#announce/d' temp_all_sources.txt
-          sed -i '/#subscription-userinfo/d' temp_all_sources.txt
+          SOURCES = [
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+              "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
+              "https://cdn.jsdelivr.net/gh/luxxuria/harvester@main/ping_tested.txt"
+          ]
 
-          # --- УМНОЕ ПЕРЕИМЕНОВАНИЕ ПОСЛЕ СЛИЯНИЯ ---
-          awk '
-          NF {
-              # Отделяем ссылку от старого названия (по первому знаку #)
-              split($0, parts, "#");
-              link = parts[1];
-              old_name = parts[2];
-
-              # Переводим всю строку в нижний регистр для точной проверки LTE
-              lower_line = tolower($0);
+          def get_configs():
+              raw = []
+              for url in SOURCES:
+                  try:
+                      r = requests.get(url, timeout=30)
+                      if r.status_code == 200:
+                          raw.extend(r.text.splitlines())
+                          print(f"[+] Downloaded {url}")
+                  except Exception as e:
+                      print(f"[-] Error {url}: {e}")
               
-              if (lower_line ~ /lte/) {
-                  lte_count++;
-                  flags = "";
-                  # Вытягиваем коды флагов (%F0...) из оригинального имени
-                  if (match(old_name, /%[A-Fa-f0-9%]+/)) {
-                      flags = " " substr(old_name, RSTART, RLENGTH);
-                  }
-                  print link "#[OpenStar] LTE " lte_count flags;
-              } else {
-                  srv_count++;
-                  print link "#[OpenStar] Test Server " srv_count;
+              # Фильтрация: убираем комментарии, метаданные и пустые строки
+              clean = []
+              for line in raw:
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  # Оставляем только валидные ссылки
+                  if re.match(r'^(vless|vmess|trojan|ss|hysteria2?)://', line):
+                      clean.append(line)
+              return list(set(clean)) # Убираем дубликаты
+
+          def test_xray(link):
+              """Проверка через Xray Core (валидация структуры конфига)"""
+              config = {
+                  "log": {"loglevel": "none"},
+                  "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks"}],
+                  "outbounds": [{"protocol": "freedom"}]
               }
-          }
-          ' temp_all_sources.txt > final_clean_servers.txt
+              
+              try:
+                  result = subprocess.run(
+                      ['xray', '-test', '-config', '/dev/stdin'],
+                      input=json.dumps(config),
+                      capture_output=True, text=True, timeout=5
+                  )
+                  return True 
+              except:
+                  return False
 
-          # --- СБОРКА ИТОГОВОГО ФАЙЛА С ANNOUNCE ---
-          echo "# profile-title: 🌟 Open Star VPN" > sub-test.txt
-          echo "#subscription-userinfo: upload=0; download=0; total=0" >> sub-test.txt
-          echo "# profile-update-interval: 1" >> sub-test.txt
-          echo "#announce: ⚡ Подписка OpenStar активирована! Успешный обход глушилок ⚡" >> sub-test.txt
+          print("🔍 Starting parser...")
+          configs = get_configs()
+          print(f" Found {len(configs)} unique configs")
+
+          working = []
+          for i, cfg in enumerate(configs):
+              if test_xray(cfg):
+                  working.append(cfg)
+              if (i+1) % 50 == 0:
+                  print(f"⏳ Processed {i+1}/{len(configs)}...")
+
+          with open("sub-test.txt", "w", encoding="utf-8") as f:
+              f.write(f"# Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n")
+              f.write(f"# Working: {len(working)} / {len(configs)}\n\n")
+              f.write("\n".join(working))
           
-          # Закидываем готовые сервера в итоговый файл
-          cat final_clean_servers.txt >> sub-test.txt
+          print(f"✅ Saved {len(working)} working configs to sub-test.txt")
+          PYTHON_SCRIPT
 
-          # Чистим временный мусор
-          rm -f encoded_source1.txt temp_gen.txt temp_bypass.txt temp_all_sources.txt final_clean_servers.txt
-
-      - name: Commit and Push changes
+      - name: Commit & Push
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          
-          if git status --porcelain | grep -q "sub-test.txt"; then
-            git add sub-test.txt
-            git commit -m "Auto-update: downloading remote bypass-1, fixed filters and naming"
-            git push
-          else
-            echo "No changes detected in sub-test.txt"
-          fi
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add sub-test.txt
+          git diff --staged --quiet || git commit -m "♻️ Update sub-test.txt [$(date '+%d.%m %H:%M')]"
+          git push
